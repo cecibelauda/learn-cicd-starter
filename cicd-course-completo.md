@@ -374,3 +374,654 @@ gh run list --branch addtests --limit 3
 - YAML: https://en.wikipedia.org/wiki/YAML
 - `nano`: https://www.nano-editor.org/dist/latest/nano.html
 - Git FAQ (directorios vacíos): https://git-scm.com/docs/gitfaq#empty-directories
+
+---
+
+# SECCIÓN 2 — Running Tests
+
+## 2.1 Pruebas unitarias en Go
+
+### Por qué importan en CI
+
+Un pipeline de CI sin pruebas no verifica nada. El repo de Notely venía con **cero pruebas unitarias**, así que el primer paso fue escribirlas.
+
+### El código bajo prueba: `internal/auth/auth.go`
+
+```go
+package auth
+
+import (
+	"errors"
+	"net/http"
+	"strings"
+)
+
+var ErrNoAuthHeaderIncluded = errors.New("no authorization header included")
+
+// GetAPIKey -
+func GetAPIKey(headers http.Header) (string, error) {
+	authHeader := headers.Get("Authorization")
+	if authHeader == "" {
+		return "", ErrNoAuthHeaderIncluded
+	}
+	splitAuth := strings.Split(authHeader, " ")
+	if len(splitAuth) < 2 || splitAuth[0] != "ApiKey" {
+		return "", errors.New("malformed authorization header")
+	}
+
+	return splitAuth[1], nil
+}
+```
+
+**Análisis:** recibe los headers HTTP, busca `Authorization`, espera el formato `ApiKey <valor>` y devuelve `<valor>`.
+
+Tiene **tres caminos posibles** → mínimo tres casos de prueba:
+
+| Camino | Entrada | Salida esperada |
+|---|---|---|
+| Éxito | `ApiKey mi-clave` | `"mi-clave"`, `nil` |
+| Sin header | (vacío) | `""`, `ErrNoAuthHeaderIncluded` |
+| Malformado | `Bearer mi-clave` | `""`, `errors.New("malformed authorization header")` |
+
+### Reglas del lenguaje que condicionan el archivo de prueba
+
+**1. El paquete lo define el directorio, no el archivo.**
+
+Todos los archivos `.go` de un mismo directorio deben declarar el mismo `package X`.
+
+```
+internal/auth/                 ← este directorio = un paquete
+├── auth.go                    → package auth
+└── get_api_key_test.go        → package auth   (obligado)
+```
+
+Si no coinciden, el compilador falla:
+
+```
+found packages auth (auth.go) and split (get_api_key_test.go)
+```
+
+**2. El sufijo `_test.go` es aparte del `package`.**
+
+Son dos cosas distintas que se confunden fácil:
+
+| Elemento | Qué determina |
+|---|---|
+| `package auth` (dentro del archivo) | A qué paquete pertenece el archivo |
+| `_test.go` (en el nombre del archivo) | Que es código de prueba → **se excluye del binario final** |
+
+Equivale a tener `src/test/java` separado de `src/main/java` en Maven, pero resuelto por el nombre del archivo en lugar de por la carpeta.
+
+**3. Única excepción — el paquete `_test`.**
+
+Go permite un paquete extra por directorio: el que termina en `_test`. Es *black-box testing*, solo ve lo **exportado** (mayúscula inicial) y requiere import explícito:
+
+```go
+package auth_test
+
+import (
+	"testing"
+	"github.com/bootdotdev/learn-cicd-starter/internal/auth"
+)
+
+func TestGetAPIKey(t *testing.T) {
+	gotKey, gotErr := auth.GetAPIKey(...)   // requiere el prefijo
+}
+```
+
+Para el curso conviene `package auth` a secas: menos ruido y permite probar funciones privadas.
+
+### Equivalencias JUnit 5 ↔ Go
+
+| Java / JUnit 5 | Go |
+|---|---|
+| `GetAPIKeyTest.java` | `get_api_key_test.go` — sufijo `_test.go` **obligatorio** |
+| `@Test void shouldX()` | `func TestX(t *testing.T)` — prefijo `Test` **obligatorio** |
+| `assertEquals(a, b)` | No existe: escribes un `if` y llamas `t.Errorf(...)` |
+| `fail()` | `t.Fatalf(...)` |
+| `@ParameterizedTest` / `@CsvSource` | *Table-driven tests*: `map` de casos + `for` |
+| `mvn test` | `go test ./...` |
+| `src/test/java` separado | Sufijo `_test.go` en el nombre |
+
+**No hay librería de asserts en la stdlib.** Si nadie llama a `t.Errorf`, el test pasa.
+
+### `t.Errorf` vs `t.Fatalf`
+
+| | Comportamiento | Cuándo usarlo |
+|---|---|---|
+| `t.Errorf` | Registra el fallo y **continúa** | Comparaciones normales — muestra todos los problemas de una vez |
+| `t.Fatalf` | Detiene el test **inmediatamente** | Cuando seguir causaría un *panic* (ej: desreferenciar un error `nil`) |
+
+### Solución: `internal/auth/get_api_key_test.go`
+
+```go
+package auth
+
+import (
+	"errors"
+	"net/http"
+	"testing"
+)
+
+func TestGetAPIKey(t *testing.T) {
+	tests := map[string]struct {
+		headers http.Header
+		wantKey string
+		wantErr error
+	}{
+		"clave válida": {
+			headers: http.Header{"Authorization": []string{"ApiKey mi-clave-secreta"}},
+			wantKey: "mi-clave-secreta",
+			wantErr: nil,
+		},
+		"sin header Authorization": {
+			headers: http.Header{},
+			wantKey: "",
+			wantErr: ErrNoAuthHeaderIncluded,
+		},
+		"header malformado - prefijo incorrecto": {
+			headers: http.Header{"Authorization": []string{"Bearer mi-clave-secreta"}},
+			wantKey: "",
+			wantErr: errors.New("malformed authorization header"),
+		},
+		"header malformado - sin valor": {
+			headers: http.Header{"Authorization": []string{"ApiKey"}},
+			wantKey: "",
+			wantErr: errors.New("malformed authorization header"),
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			gotKey, gotErr := GetAPIKey(tc.headers)
+
+			if gotKey != tc.wantKey {
+				t.Errorf("clave: se obtuvo %q, se esperaba %q", gotKey, tc.wantKey)
+			}
+
+			if tc.wantErr == nil {
+				if gotErr != nil {
+					t.Errorf("error: se obtuvo %v, no se esperaba error", gotErr)
+				}
+				return
+			}
+
+			if gotErr == nil {
+				t.Fatalf("error: no se obtuvo error, se esperaba %v", tc.wantErr)
+			}
+
+			if gotErr.Error() != tc.wantErr.Error() {
+				t.Errorf("error: se obtuvo %q, se esperaba %q", gotErr, tc.wantErr)
+			}
+		})
+	}
+}
+```
+
+**Claves del código:**
+
+- `struct{...}` anónimo dentro del `map` → la "fila" de la tabla de casos, equivalente a `@CsvSource`
+- `http.Header` es un `map[string][]string`; por eso el valor va entre corchetes: `[]string{"ApiKey ..."}`
+- `t.Run(name, func...)` crea un **subtest** con nombre propio: si falla, Go indica exactamente qué caso
+- Los errores se comparan con `.Error()` (el texto) porque el error "malformed" se crea nuevo en cada llamada y no puede compararse por identidad con `==`
+
+### Sobre `reflect.DeepEqual`
+
+El [blog de Dave Cheney](https://dave.cheney.net/2019/05/07/prefer-table-driven-tests) que recomienda la lección usa `reflect.DeepEqual` porque compara un **slice** (`[]string`), y en Go los slices no se comparan con `==`.
+
+Como `GetAPIKey` devuelve un `string`, basta con `!=` y no hace falta importar `reflect`.
+
+⚠️ El código del blog **no funciona copiado literal**: declara `package split` y llama a una función `Split` que no existe en Notely. Del blog se toma el **patrón**, no el código.
+
+### Verificación local
+
+```bash
+go test ./...                  # todos los tests
+go test ./internal/auth -v     # detalle por subtest
+go build ./...                 # compila (silencio = éxito)
+go vet ./...                   # análisis estático
+```
+
+Salida esperada de `-v`:
+
+```
+=== RUN   TestGetAPIKey
+=== RUN   TestGetAPIKey/clave_válida
+=== RUN   TestGetAPIKey/sin_header_Authorization
+=== RUN   TestGetAPIKey/header_malformado_-_prefijo_incorrecto
+--- PASS: TestGetAPIKey (0.00s)
+PASS
+```
+
+---
+
+## 2.2 Tests on CI — ejecutar las pruebas en el pipeline
+
+**Tarea:** eliminar el step `go version` del workflow y reemplazarlo por uno que ejecute las pruebas.
+
+### Workflow actualizado: `.github/workflows/ci.yml`
+
+```yaml
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.1"
+
+      - name: Run unit tests
+        run: go test ./...
+```
+
+El único cambio respecto a la Sección 1.4 es el último step: `run: go version` → `run: go test ./...`
+
+### Por qué esto hace fallar el CI
+
+Cada `run:` ejecuta un shell. Si el comando devuelve un **exit code distinto de 0**, el step falla y el job entero se marca en rojo.
+
+`go test` devuelve `1` cuando algún test falla. Ahí está todo el mecanismo — no hay integración especial entre GitHub Actions y Go.
+
+Esto conecta directamente con la convención de exit codes vista en la Sección 1.1.
+
+### Validación del fallo (paso crítico de la lección)
+
+La lección insiste en **romper el código a propósito** para confirmar que el CI realmente detecta fallos.
+
+> *"Te sorprendería cuántas veces las empresas en las que he trabajado creían tener un CI que verificaba fallos, pero el código roto en realidad no hacía fallar el CI."*
+
+Se modificó `internal/auth/auth.go` temporalmente:
+
+```go
+if len(splitAuth) < 2 || splitAuth[0] != "Bearer" {   // roto a propósito
+```
+
+Verificación del exit code — **esto es lo que lee GitHub Actions**:
+
+```bash
+go test ./... ; echo "exit code: $?"
+```
+
+```
+--- FAIL: TestGetAPIKey/clave_válida (0.00s)
+    get_api_key_test.go:39: clave: se obtuvo "", se esperaba "mi-clave-secreta"
+FAIL
+exit code: 1
+```
+
+Se hizo commit y push del código roto, se confirmó el ❌ en el PR, y luego se revirtió a `"ApiKey"` → ✅ verde.
+
+### Diagrama del mecanismo completo
+
+```
+git push  →  evento pull_request  →  GitHub levanta un runner Ubuntu
+                                      ├── actions/checkout  (clona el código)
+                                      ├── actions/setup-go  (instala Go)
+                                      └── go test ./...
+                                             ├── exit 0 → ✅ step pasa → job verde
+                                             └── exit 1 → ❌ step falla → job rojo
+```
+
+Un job se detiene en el **primer step que falle**; los siguientes no se ejecutan.
+
+### Inspeccionar fallos desde la terminal
+
+```bash
+gh pr checks --watch        # seguir los checks en vivo
+gh run list --limit 3
+gh run view --log-failed    # logs de los steps que fallaron
+```
+
+---
+
+## 2.3 Code Coverage
+
+```
+code_coverage = (lineas_cubiertas / lineas_totales) * 100
+```
+
+Si hay `1000` líneas de código y las pruebas cubren `500`, la cobertura es `50%`.
+
+**Tarea:** agregar el flag `-cover` para imprimir la cobertura en los logs (sin hacer fallar el CI).
+
+### El cambio
+
+```yaml
+      - name: Run unit tests
+        run: go test -cover ./...
+```
+
+⚠️ **El orden importa.** En Go los flags van **entre el subcomando y los paquetes**. `go test ./... -cover` no funciona como se espera.
+
+### Salida
+
+```
+ok      github.com/bootdotdev/learn-cicd-starter/internal/auth  0.003s  coverage: 100.0% of statements
+?       github.com/bootdotdev/learn-cicd-starter               [no test files]
+```
+
+La línea con `?` significa que ese paquete **no tiene pruebas**. No cuenta como 0% — queda fuera del cálculo. Por eso aparece `100.0%`: es la cobertura del paquete `auth` solamente.
+
+Para obtener el número global del proyecto:
+
+```bash
+go test -coverprofile=coverage.out ./...
+go tool cover -func=coverage.out | tail -1
+go tool cover -html=coverage.out          # reporte visual en el navegador
+```
+
+### Reportar vs. Exigir
+
+| | Qué hace | Efecto |
+|---|---|---|
+| **Reportar** (`-cover`) | Imprime el % en los logs | Informativo. El CI pasa igual |
+| **Exigir** (*quality gate*) | Compara el % contra un umbral | Si no llega, el build **falla** y el PR se bloquea |
+
+Esta lección solo implementa el primero.
+
+### Equivalencia con el stack de La Tinka (Java + SonarQube + JaCoCo)
+
+```
+mvn test  →  JaCoCo instrumenta y genera target/site/jacoco/jacoco.xml
+                              ↓
+          sonar-scanner lee ese XML
+                              ↓
+          SonarQube calcula % y lo compara con el Quality Gate
+                              ↓
+                  ✅ Passed  /  ❌ Failed
+```
+
+Equivalente local de `go test -cover`:
+
+```bash
+mvn clean verify
+open target/site/jacoco/index.html
+```
+
+**Condiciones por defecto del *Sonar way*** — aplican sobre **código nuevo**, no sobre todo el proyecto (concepto *Clean as You Code*):
+
+| Condición | Umbral |
+|---|---|
+| Cobertura en código nuevo | ≥ 80% |
+| Líneas duplicadas en código nuevo | ≤ 3% |
+| Bugs / vulnerabilidades nuevas | 0 |
+| Security hotspots revisados | 100% |
+
+**Cómo saber si el gate bloquea o solo reporta:**
+
+1. Dashboard de SonarQube → *Project Settings → Quality Gate* (cuál está asignado) y *Quality Gates* global (sus condiciones)
+2. En el pipeline, buscar el paso que espera el resultado. En Jenkins es:
+   ```groovy
+   waitForQualityGate abortPipeline: true
+   ```
+   Si ese paso **no está**, Sonar reporta pero no bloquea nada — el escenario más común en equipos que adoptaron Sonar sin cerrar el ciclo
+3. `cat sonar-project.properties` → verificar que `sonar.coverage.jacoco.xmlReportPaths` apunte a un archivo que realmente se genera. Si no, Sonar reporta **0%** aunque existan pruebas
+
+### Por qué la métrica es controversial
+
+Es posible tener 100% de cobertura y aun así tener bugs, y 0% de cobertura con una app libre de errores. Las pruebas unitarias codifican el comportamiento esperado de unidades de código, pero no garantizan ausencia de bugs.
+
+El autor del curso argumenta que no todas las funciones merecen la misma atención, y que **mockear sistemas externos (como bases de datos) en pruebas unitarias no es buena idea** — ese es mejor caso de uso para pruebas de integración.
+
+Postura recomendada para un desarrollador que entra a un equipo nuevo: conocer la métrica, respetar el umbral de la organización, y plantear opiniones propias cuando ya se tenga confianza ganada.
+
+---
+
+## 2.4 README Badge
+
+**Tarea:** agregar un badge dinámico al `README.md` que muestre el estado de las pruebas.
+
+### Estructura de la URL
+
+```
+https://github.com/<OWNER>/<REPOSITORY>/actions/workflows/<WORKFLOW_FILE>/badge.svg
+```
+
+### Sintaxis de imagen en Markdown
+
+```markdown
+![texto alternativo](URL_DE_LA_IMAGEN)
+```
+
+### Línea agregada al inicio del README
+
+```markdown
+![Tests](https://github.com/cecibelauda/learn-cicd-starter/actions/workflows/ci.yml/badge.svg)
+```
+
+### Detalles importantes
+
+| Aspecto | Detalle |
+|---|---|
+| Qué va en `<WORKFLOW_FILE>` | El **nombre del archivo** (`ci.yml`), no el `name:` interno |
+| Qué texto muestra el badge | El `name:` interno del workflow → por eso dice `ci passing` |
+| Es dinámico | GitHub regenera el SVG en cada request, consultando el último run |
+| Qué rama consulta | La **rama por defecto** (`main`), salvo que se especifique otra |
+| Cuándo aparece | Solo tras mergear a `main` — en una rama no se ve en la portada |
+
+### Variantes útiles
+
+```markdown
+<!-- Badge de una rama específica -->
+![Tests](https://github.com/cecibelauda/learn-cicd-starter/actions/workflows/ci.yml/badge.svg?branch=develop)
+
+<!-- Badge clickeable → sintaxis [![alt](imagen)](destino) -->
+[![Tests](https://github.com/cecibelauda/learn-cicd-starter/actions/workflows/ci.yml/badge.svg)](https://github.com/cecibelauda/learn-cicd-starter/actions/workflows/ci.yml)
+```
+
+### Si el badge sale gris con "no status"
+
+Significa que el workflow nunca corrió sobre la rama por defecto. Con un `on:` que solo tiene `pull_request`, normalmente se resuelve tras el merge del PR.
+
+Para forzar que también corra en `main`:
+
+```yaml
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+```
+
+**Resultado obtenido:** ✅ badge en verde mostrando `ci passing`.
+
+---
+
+## 2.5 Comandos nuevos de la Sección 2
+
+### Go
+
+```bash
+go test ./...                    # todas las pruebas, recursivo
+go test ./internal/auth -v       # detalle por subtest
+go test -cover ./...             # con reporte de cobertura
+go test ./... ; echo $?          # ver el exit code (0 = ok, 1 = falla)
+go build ./...                   # compila (silencio = éxito)
+go vet ./...                     # análisis estático
+gofmt -w <archivo>               # formatea e indenta automáticamente
+
+go test -coverprofile=coverage.out ./...
+go tool cover -func=coverage.out | tail -1
+go tool cover -html=coverage.out
+```
+
+`./...` significa: el directorio actual **y todos sus subdirectorios**.
+
+### GitHub CLI
+
+```bash
+gh repo set-default cecibelauda/learn-cicd-starter   # obligatorio en forks
+gh repo set-default --view
+
+gh pr status
+gh pr checks --watch
+gh pr merge --merge
+gh pr view --web
+
+gh run list --limit 3
+gh run view --log-failed
+gh run watch
+gh repo view --web
+```
+
+Alternativa sin configurar el default:
+
+```bash
+gh pr checks --repo cecibelauda/learn-cicd-starter
+gh pr merge --repo cecibelauda/learn-cicd-starter --merge
+```
+
+### Ciclo de ramas por sección
+
+```bash
+git checkout main
+git pull origin main             # ⚠️ el paso que más se olvida
+git checkout -b <nombre-rama>
+# ... trabajo ...
+git add .
+git commit -m "tipo: descripción"
+git push origin <nombre-rama>
+```
+
+Limpieza tras el merge:
+
+```bash
+git branch -d <rama>                   # borra local
+git push origin --delete <rama>        # borra remota
+git fetch --prune                      # limpia referencias muertas
+```
+
+---
+
+## 2.6 Notas y errores encontrados
+
+| Situación | Causa | Solución |
+|---|---|---|
+| `zsh: command not found: code` | VS Code no instaló el comando en el PATH | En VS Code: `Cmd+Shift+P` → *Shell Command: Install 'code' command in PATH*. Alternativa: usar `nano` |
+| `No default remote repository has been set` | `gh` detecta que el repo es un fork y no sabe si apuntar al fork o al upstream | `gh repo set-default cecibelauda/learn-cicd-starter` ⚠️ nunca `bootdotdev` |
+| `found packages auth and split` | Se copió literal el código del blog de Dave Cheney | Usar `package auth` y llamar a `GetAPIKey`, no a `Split` |
+| Código pegado en `nano` se escalona | Auto-indent del editor | Abrir con `nano -i`, o correr `gofmt -w <archivo>` después |
+| `go test ./... -cover` no reporta cobertura | Los flags de Go van antes de los paquetes | `go test -cover ./...` |
+| Badge en gris con "no status" | El workflow nunca corrió sobre `main` | Se resuelve tras el merge. Opcional: agregar `push: branches: [main]` |
+
+### Reglas de trabajo consolidadas
+
+1. **Una rama = una unidad de cambio = un PR.** Rama mergeada = ciclo cerrado, no reutilizar
+2. **Siempre `git pull` en `main` antes de ramificar**, o habrá conflictos al mergear
+3. **Validar el CI rompiéndolo a propósito** al menos una vez, para confirmar que sí detecta fallos
+4. **Los flags de Go van antes de los paquetes:** `go test -cover ./...`
+5. Tras pegar código Go en un editor de terminal, siempre `gofmt -w`
+
+---
+
+## 2.7 Flujo completo ejecutado en la Sección 2
+
+```bash
+# 1. Crear el archivo de pruebas
+nano internal/auth/get_api_key_test.go     # contenido en la sección 2.1
+gofmt -w internal/auth/get_api_key_test.go
+go test ./...
+
+# 2. Agregar las pruebas al workflow
+nano .github/workflows/ci.yml              # go version → go test ./...
+
+# 3. Romper el código a propósito y validar que el CI falla
+nano internal/auth/auth.go                 # "ApiKey" → "Bearer"
+go test ./... ; echo $?                    # debe imprimir 1
+git add .
+git commit -m "ci: run unit tests in CI (intentionally broken code)"
+git push origin addtests
+gh repo set-default cecibelauda/learn-cicd-starter
+gh pr checks --watch                       # ❌ rojo
+
+# 4. Arreglar el código
+nano internal/auth/auth.go                 # "Bearer" → "ApiKey"
+go test ./...
+git add internal/auth/auth.go
+git commit -m "fix: restore ApiKey prefix check"
+git push origin addtests                   # re-dispara el workflow ✅
+
+# 5. Agregar el flag de cobertura
+nano .github/workflows/ci.yml              # go test -cover ./...
+git add .github/workflows/ci.yml
+git commit -m "ci: report test coverage"
+git push origin addtests
+
+# 6. Agregar el badge al README
+nano README.md                             # línea del badge al inicio
+git add README.md
+git commit -m "docs: add tests status badge to README"
+git push origin addtests
+
+# 7. Mergear y sincronizar
+gh pr checks --watch
+gh pr merge --merge
+git checkout main
+git pull origin main
+gh repo view --web                         # verificar badge "ci passing" ✅
+```
+
+---
+
+## 2.8 Referencias oficiales de la Sección 2
+
+**Go — testing**
+- Paquete `testing`: https://pkg.go.dev/testing
+- Tutorial oficial "Add a test": https://go.dev/doc/tutorial/add-a-test
+- Flags de testing (incluye `-cover`): https://pkg.go.dev/cmd/go#hdr-Testing_flags
+- Test packages: https://pkg.go.dev/cmd/go#hdr-Test_packages
+- Package clause (spec): https://go.dev/ref/spec#Package_clause
+- `reflect.DeepEqual`: https://pkg.go.dev/reflect#DeepEqual
+- Dave Cheney — Prefer table driven tests: https://dave.cheney.net/2019/05/07/prefer-table-driven-tests
+
+**GitHub Actions**
+- `jobs.<job_id>.steps[*].run`: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idstepsrun
+- Adding a workflow status badge: https://docs.github.com/en/actions/monitoring-and-troubleshooting-workflows/monitoring-workflows/adding-a-workflow-status-badge
+
+**GitHub CLI**
+- `gh repo set-default`: https://cli.github.com/manual/gh_repo_set-default
+- `gh pr merge`: https://cli.github.com/manual/gh_pr_merge
+
+**Cobertura y calidad (contexto Java / La Tinka)**
+- SonarQube — Quality Gates: https://docs.sonarsource.com/sonarqube-server/latest/instance-administration/analysis-functions/quality-gates/
+- SonarQube — Test coverage: https://docs.sonarsource.com/sonarqube-server/latest/analyzing-source-code/test-coverage/overview/
+- Boot.dev — Don't mock database connections: https://www.boot.dev/blog/backend/writing-good-unit-tests-dont-mock-database-connections/
+- CircleCI — Unit vs integration testing: https://circleci.com/blog/unit-testing-vs-integration-testing/
+
+**Markdown**
+- Cheat sheet: https://www.markdownguide.org/cheat-sheet/
+- Imágenes: https://www.markdownguide.org/basic-syntax/#images-1
+
+---
+
+# ESTADO DEL CURSO
+
+| Sección | Estado |
+|---|---|
+| 1 — Fundamentos de CI/CD y GitHub Actions | ✅ Completada |
+| 2 — Running Tests | ✅ Completada |
+| 3 — Security | ⏳ Pendiente |
+| 4 — Formatting / Linting | ⏳ Pendiente |
+| 5 — Continuous Deployment | ⏳ Pendiente |
+
+**Rama `addtests`:** mergeada a `main` ✅ — ciclo cerrado, crear rama nueva para la Sección 3.
+
+**Próximo paso sugerido:**
+
+```bash
+git checkout main
+git pull origin main
+git checkout -b security
+```
