@@ -2,8 +2,8 @@
 
 **Estudiante:** Auda (Cecibel Espinoza)
 **Repositorio:** https://github.com/cecibelauda/learn-cicd-starter
-**Rama de trabajo:** `linting` (activa, PR #3) — anteriores: `addtests` (mergeada, PR #1), `formatting` (mergeada, PR #2)
-**Directorio local:** `~/cicd_course/learn-cicd-starter`
+**Ramas:** `addtests` (PR #1), `formatting` (PR #2), `linting` (PR #3/#4), `security` (PR #5) — todas mergeadas a `main`
+**Directorio local:** `~/learn-cicd-starter`
 
 ---
 
@@ -2166,6 +2166,517 @@ gh pr checks --repo cecibelauda/learn-cicd-starter --watch   # Style ✅  Tests 
 
 ---
 
+# SECCIÓN 5 — Security
+
+## 5.1 Verificaciones de seguridad estáticas
+
+Otro uso habitual de la CI son las **verificaciones de seguridad estáticas**: análisis que se ejecutan sobre el código (sin correrlo) para encontrar posibles vulnerabilidades.
+
+La herramienta open source más popular para Go es **[Gosec](https://github.com/securego/gosec)**.
+
+> **Idea central:** `go fmt` cuida la apariencia, `staticcheck` cuida la calidad y `gosec` cuida la **seguridad**. Las tres convierten sus hallazgos en un exit code ≠ 0 que GitHub Actions entiende.
+
+### Instalación y ejecución local
+
+```bash
+go install github.com/securego/gosec/v2/cmd/gosec@latest
+gosec ./...                 # siempre desde la raíz del repo
+```
+
+Si aparece `command not found`, aplica la misma solución de la Sección 4.2 (`$(go env GOPATH)/bin` en el `PATH` de `~/.zshrc`).
+
+### Cómo leer un hallazgo de gosec
+
+```
+[/Users/Cecibel/learn-cicd-starter/main.go:92-95] - G112 (CWE-400): Potential Slowloris Attack because ReadHeaderTimeout is not configured in the http.Server (Confidence: LOW, Severity: MEDIUM)
+    91: router.Mount("/v1", v1Router)
+  > 92: srv := &http.Server{
+  > 93: Addr:    ":" + port,
+  > 94: Handler: router,
+  > 95: }
+
+Summary:
+  Files  : 12
+  Lines  : 618
+  Nosec  : 0
+  Issues : 1
+```
+
+| Parte | Significado |
+|---|---|
+| `main.go:92-95` | Archivo y líneas afectadas |
+| `G112` | Código de la regla de gosec |
+| `CWE-400` | Clasificación estándar de la debilidad ([MITRE CWE](https://cwe.mitre.org/)) |
+| `Confidence` | Qué tan seguro está gosec de que es un problema real |
+| `Severity` | Qué tan grave sería si lo es |
+| `>` | Líneas exactas del hallazgo |
+| `Nosec` | Cuántas líneas fueron excluidas con `#nosec` |
+| `Issues` | Total de hallazgos → si es > 0, exit code 1 |
+
+### Equivalencia con el stack de La Tinka
+
+| Go | Java |
+|---|---|
+| `gosec` | SpotBugs + Find Security Bugs, reglas de seguridad de SonarQube (*Vulnerabilities* y *Security Hotspots*) |
+| Códigos `G1xx` | Reglas `java:S...` de Sonar / categorías OWASP |
+| `// #nosec G706 -- motivo` | `@SuppressWarnings` / `// NOSONAR` |
+
+---
+
+## 5.2 CI Security — gosec en el job Tests
+
+**Tarea:** igual que `staticcheck`, `gosec` no viene con Go, así que hay que instalarlo en el runner. Como la seguridad **no es un tema de estilo**, va en el job **Tests**, después de `go test`.
+
+### Workflow actualizado: `.github/workflows/ci.yml`
+
+```yaml
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.1"
+
+      - name: Run unit tests
+        run: go test -cover ./...
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      - name: Run gosec
+        run: gosec ./...
+
+  style:
+    name: Style
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.1"
+
+      - name: Check formatting
+        run: test -z $(go fmt ./...)
+
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: Run staticcheck
+        run: staticcheck ./...
+```
+
+Solo cambian las **dos últimas steps del job `tests`**.
+
+### Qué va en cada job
+
+| Job | Pregunta que responde | Steps |
+|---|---|---|
+| **Tests** | ¿El código funciona y es seguro? | `go test`, `gosec` |
+| **Style** | ¿El código se ve y está escrito bien? | `go fmt`, `staticcheck` |
+
+> 💡 No hace falta configurar el `PATH` en el runner: `actions/setup-go` ya agrega `$(go env GOPATH)/bin`.
+
+### Validación del fallo (intencional)
+
+La primera vez que se hace push del nuevo `ci.yml`, el check **debe fallar**, porque el código de Notely todavía tiene hallazgos.
+
+```
+           ┌──────────── Job: Tests ────────────┐
+ push ──►  checkout → setup-go → go test ✅ → install gosec ✅ → gosec ❌
+           └────────────────────────────────────┘
+           ┌──────────── Job: Style ────────────┐
+           checkout → setup-go → go fmt ✅ → staticcheck ✅
+           └────────────────────────────────────┘
+```
+
+| Commit | Resultado |
+|---|---|
+| `ci: add gosec security check to tests job` | Tests ❌ (en *Run gosec*) / Style ✅ |
+
+---
+
+## 5.3 Fix Security Issues — corregir los hallazgos
+
+**Tarea:** corregir los problemas de seguridad **sin romper funcionalidad**. Si el archivo `.env` no existe, el servidor solo debe imprimir una advertencia y continuar (eso ya estaba resuelto en `main.go`).
+
+### Hallazgos encontrados
+
+| Regla | CWE | Archivo | Problema | Riesgo |
+|---|---|---|---|---|
+| **G104** | CWE-703 | `json.go` | `w.Write(dat)` ignora el error que devuelve | Fallos silenciosos al escribir la respuesta |
+| **G112** | CWE-400 | `main.go` | `http.Server` sin `ReadHeaderTimeout` | Ataque **Slowloris** (agotar conexiones) |
+| **G706** | CWE-117 | `main.go` | Se loguea `port` (variable de entorno) sin validar | **Log injection** (líneas falsas en el log) |
+
+> ⚠️ **G706 no lo menciona el curso**: es una regla nueva de gosec que salió en el análisis local (versión `dev`). Como el CI usa `@latest`, también la habría detectado.
+
+### G104 — errores no manejados
+
+En Go, ignorar un error es un bug silencioso. Si `Write` falla (por ejemplo, porque el cliente cerró la conexión), nadie se entera.
+
+**Antes:**
+
+```go
+	w.WriteHeader(code)
+	w.Write(dat)
+}
+```
+
+**Después:**
+
+```go
+	w.WriteHeader(code)
+	if _, err := w.Write(dat); err != nil {
+		log.Printf("Error writing response: %s", err)
+	}
+}
+```
+
+Solo se registra en el log: como `WriteHeader` ya envió los headers, no se puede cambiar el status code.
+
+### G112 — Slowloris
+
+🧠 **Analogía:** un cliente llega a la ventanilla y dicta su pedido letra por letra, una cada 10 minutos. Si nadie le pone un límite, unos pocos clientes así bloquean todas las ventanillas. `ReadHeaderTimeout` es ese límite.
+
+```
+Cliente lento ──H──(espera)──e──(espera)──a──...  ⏱ 10 s → ❌ conexión cerrada
+```
+
+```go
+	srv := &http.Server{
+		Addr:              ":" + strconv.Itoa(portNum),
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+```
+
+Requiere `import "time"`.
+
+Otros timeouts de `http.Server` que se usan en producción:
+
+| Campo | Limita |
+|---|---|
+| `ReadHeaderTimeout` | Tiempo para leer **los headers** |
+| `ReadTimeout` | Tiempo para leer **toda la request** (headers + body) |
+| `WriteTimeout` | Tiempo para escribir la respuesta |
+| `IdleTimeout` | Tiempo que una conexión keep-alive puede quedar inactiva |
+
+### G706 — Log injection (taint analysis)
+
+`port` viene de `os.Getenv("PORT")`, es decir, de **fuera del programa**. gosec lo marca como dato **contaminado** (*tainted*) y sigue su recorrido hasta el log.
+
+🧠 **Analogía:** un libro de visitas donde alguien escribe `"Juan\n10:40 ADMIN: acceso concedido"` e inventa una línea falsa en el registro.
+
+```
+os.Getenv("PORT") ──(sin validar)──────────────────► log.Printf(...)  ❌ G706
+os.Getenv("PORT") ──► strconv.Atoi ──► int validado ──► log.Printf(...)  ✅
+```
+
+**Solución:** validar que el puerto sea un número en el rango válido y usar **solo el valor validado**:
+
+```go
+	port := os.Getenv("PORT")
+	if port == "" {
+		log.Fatal("PORT environment variable is not set")
+	}
+	portNum, err := strconv.Atoi(port)
+	if err != nil || portNum < 1 || portNum > 65535 {
+		log.Fatal("PORT environment variable must be a number between 1 and 65535")
+	}
+	...
+	log.Printf("Serving on port: %d\n", portNum)   // %d y portNum, no %s y port
+```
+
+Requiere `import "strconv"`.
+
+⚠️ **Detalle clave:** si se valida pero se sigue logueando `port` (el string original), G706 **persiste**. Hay que usar `portNum` en todos los lugares donde antes se usaba `port`.
+
+### `#nosec`: excepciones justificadas
+
+Si una regla marca un falso positivo, se puede silenciar **con justificación**:
+
+```go
+log.Printf("Serving on port: %d\n", portNum) // #nosec G706 -- portNum validated as int in range 1-65535
+```
+
+| ✅ Correcto | ❌ Incorrecto |
+|---|---|
+| `#nosec G706 -- motivo` (regla específica + justificación) | `#nosec` a secas (silencia todas las reglas de la línea) |
+| Después de validar el dato | Para que el CI pase sin corregir nada |
+
+No fue necesario en este caso: con `portNum` validado, gosec reportó `Issues : 0`.
+
+### Código final de `main.go` (partes modificadas)
+
+```go
+import (
+	"database/sql"
+	"embed"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/go-chi/chi"
+	"github.com/go-chi/cors"
+	"github.com/joho/godotenv"
+
+	"github.com/bootdotdev/learn-cicd-starter/internal/database"
+
+	_ "github.com/tursodatabase/libsql-client-go/libsql"
+)
+
+func main() {
+	err := godotenv.Load(".env")
+	if err != nil {
+		log.Printf("warning: assuming default configuration. .env unreadable: %v", err)
+	}
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		log.Fatal("PORT environment variable is not set")
+	}
+	portNum, err := strconv.Atoi(port)
+	if err != nil || portNum < 1 || portNum > 65535 {
+		log.Fatal("PORT environment variable must be a number between 1 and 65535")
+	}
+
+	// ... (sin cambios) ...
+
+	router.Mount("/v1", v1Router)
+	srv := &http.Server{
+		Addr:              ":" + strconv.Itoa(portNum),
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	log.Printf("Serving on port: %d\n", portNum)
+	log.Fatal(srv.ListenAndServe())
+}
+```
+
+### Verificación local completa (replica el CI)
+
+```bash
+cd ~/learn-cicd-starter
+go fmt ./...
+go build -o notely && echo "build OK"
+go test -cover ./...
+test -z "$(go fmt ./...)" && echo "fmt OK"
+staticcheck ./...
+gosec ./...                                   # Issues : 0
+```
+
+### Prueba funcional
+
+```bash
+PORT=8080 ./notely
+# en otra terminal:
+curl -i http://localhost:8080/v1/healthz     # HTTP/1.1 200 OK
+```
+
+---
+
+## 5.4 Security Review — la CI no reemplaza el criterio
+
+Pasar todos los tests, linters y checks de seguridad **no significa que el código sea perfecto**, ni siquiera que sea "bueno".
+
+Las pruebas automatizadas eliminan aproximadamente el **~80 %** de los bugs obvios, antipatrones de estilo y vulnerabilidades, pero no todo. **Igual hay que usar la cabeza.**
+
+🧠 **Analogía:** la CI es el detector de metales del aeropuerto. Atrapa lo obvio, pero no reemplaza al agente que observa comportamientos sospechosos.
+
+```
+┌────────── Calidad del código ──────────┐
+│  ~80 % → CI automática                 │
+│          (tests, fmt, staticcheck,     │
+│           gosec)                       │
+│  ~20 % → criterio humano               │
+│          (code review, diseño,         │
+│           lógica de negocio, authz)    │
+└────────────────────────────────────────┘
+```
+
+Ejemplos de lo que `gosec` **no** detecta:
+
+| Riesgo | Por qué se le escapa |
+|---|---|
+| Un usuario puede ver notas de otro (falla de autorización) | Es lógica de negocio, no un patrón de código |
+| CORS demasiado abierto (`AllowedOrigins: "https://*"`) | Es una decisión de configuración válida en sintaxis |
+| API keys sin expiración ni rotación | Es diseño del sistema |
+| Datos sensibles en logs por diseño | Solo detecta flujos que reconoce como *tainted* |
+
+---
+
+## 5.5 Comandos nuevos de la Sección 5
+
+### Gosec
+
+```bash
+go install github.com/securego/gosec/v2/cmd/gosec@latest
+gosec ./...                          # analizar todo el código propio
+gosec ./... ; echo $?                # 0 = limpio, 1 = hallazgos
+gosec -include=G104,G112 ./...       # solo ciertas reglas
+gosec -exclude=G104 ./...            # excluir reglas
+gosec -fmt=json -out=report.json ./...   # reporte en JSON
+```
+
+### nano (edición sin mouse)
+
+Seleccionar con el mouse lo hace la **Terminal de Mac**, no nano; por eso `Delete` no borra la selección.
+
+| Atajo | Acción |
+|---|---|
+| `nano +99 archivo` | Abrir el archivo directamente en la línea 99 |
+| `Ctrl + K` | Cortar (borrar) la línea completa |
+| `Ctrl + 6` | Iniciar una selección (*mark*); luego flechas + `Ctrl + K` |
+| `Ctrl + U` | Pegar lo último cortado |
+| `Ctrl + _` | Ir a un número de línea |
+| `Ctrl + E` / `Ctrl + A` | Ir al final / inicio de la línea |
+| `Ctrl + O` → `Enter` | Guardar |
+| `Ctrl + X` | Salir |
+
+### Shell y Git
+
+```bash
+sed -n '103p' main.go                 # imprimir solo la línea 103
+cat -n main.go | sed -n '90,110p'     # ver un rango con números de línea
+tail -12 main.go                      # últimas 12 líneas
+git rev-parse --show-toplevel         # ruta de la raíz del repo
+cd $(git rev-parse --show-toplevel)   # ir a la raíz desde cualquier subcarpeta
+git branch -d security                # borrar la rama local ya mergeada
+```
+
+---
+
+## 5.6 Notas y errores encontrados
+
+| Situación | Causa | Solución |
+|---|---|---|
+| `fatal: pathspec '.github/workflows/ci.yml' did not match any files` | `git add` ejecutado **dentro** de `.github/workflows/` → Git buscó `.github/workflows/.github/workflows/ci.yml` | Volver a la raíz (`cd ~/learn-cicd-starter`) y repetir `add` + `commit` + `push` |
+| `git push` creó la rama `security` en GitHub, pero vacía | El commit anterior falló; `push` subió la rama sin cambios nuevos | Hacer el commit desde la raíz y `git push` de nuevo |
+| `no new variables on left side of :=` | El bloque `srv := &http.Server{...}` se **pegó debajo** del original en vez de reemplazarlo | Borrar el bloque viejo; dejar un solo `srv :=` antes de `ListenAndServe()` |
+| Código después de `log.Fatal(srv.ListenAndServe())` | Ese código nunca se ejecuta: el servidor bloquea ahí | El `srv` siempre se define **antes** |
+| En nano, seleccionar con el mouse + `Delete` no borra | La selección es de la Terminal, no de nano | `Ctrl + K` por línea, o `Ctrl + 6` + flechas + `Ctrl + K` |
+| G706 persistía después de validar con `strconv.Atoi` | El `log.Printf` seguía usando `port` (string original) | Usar `portNum` con `%d` |
+| `gosec` reporta G706, que el curso no menciona | Regla nueva de gosec (taint analysis) | Validar el dato de entrada; `#nosec` solo con justificación |
+| `Error building the SSA representation... type errors` | `gosec` no puede analizar código que no compila | Primero `go build`; después `gosec` |
+
+### Reglas de trabajo consolidadas
+
+1. **Todos los comandos de Git y Go se ejecutan desde la raíz del repo.** Revisar que el prompt diga `learn-cicd-starter %`, no `workflows %`.
+2. **Reemplazar no es agregar:** al corregir un bloque de código, borrar el original.
+3. **Orden de verificación:** `go build` → `go test` → `go fmt` → `staticcheck` → `gosec`. Si no compila, los demás no sirven.
+4. **Todo dato externo (env vars, headers, body) se valida antes de usarlo**, y después se usa **solo el valor validado**.
+5. **Nunca ignorar un error en Go:** manejarlo o, como mínimo, loguearlo.
+6. **`#nosec` solo con regla específica y justificación.**
+7. **La CI cubre ~80 %; el code review cubre el resto.**
+
+---
+
+## 5.7 Flujo completo ejecutado en la Sección 5
+
+```bash
+# 1. Rama nueva desde main actualizado
+cd ~/learn-cicd-starter
+git checkout main
+git pull origin main
+git checkout -b security
+
+# 2. Lección Security Checks: gosec local
+go install github.com/securego/gosec/v2/cmd/gosec@latest
+gosec ./...                                    # hallazgos (no corregir aún)
+
+# 3. Lección CI Security: agregar gosec al job Tests
+nano .github/workflows/ci.yml                  # contenido en la sección 5.2
+git add .github/workflows/ci.yml               # ⚠️ desde la raíz
+git commit -m "ci: add gosec security check to tests job"
+git push -u origin security
+
+# 4. PR #5 (security → main) en el fork → Tests ❌ en "Run gosec" (intencional)
+
+# 5. Lección Fix Security Issues
+nano json.go                                   # G104: manejar error de w.Write
+nano main.go                                   # G112: ReadHeaderTimeout
+                                               # G706: validar PORT con strconv.Atoi, loguear portNum
+go fmt ./...
+go build -o notely && echo "build OK"
+go test -cover ./...
+staticcheck ./...
+gosec ./...                                    # Issues : 0
+PORT=8080 ./notely                             # + curl /v1/healthz → 200 OK
+
+git add json.go main.go
+git commit -m "fix: handle write error and add ReadHeaderTimeout (gosec G104, G112)"
+git push                                       # Tests ✅  Style ✅
+
+# 6. Enviar en Boot.dev la URL del repo y mergear
+# https://github.com/cecibelauda/learn-cicd-starter
+git checkout main
+git pull origin main                           # Fast-forward → 11e3175 Merge PR #5
+```
+
+Commits de la rama `security`:
+
+```
+6b9c404 fix: handle write error and add ReadHeaderTimeout (gosec G104, G112)
+922191a ci: add gosec security check to tests job
+```
+
+> El commit `6b9c404` también incluye la corrección de G706 (validación de `PORT`), aunque el mensaje solo menciona G104 y G112.
+
+---
+
+## 5.8 Referencias oficiales de la Sección 5
+
+**Gosec**
+- Repositorio y documentación: https://github.com/securego/gosec
+- Reglas disponibles: https://github.com/securego/gosec#available-rules
+- Anotar código con `#nosec`: https://github.com/securego/gosec#annotating-code
+- Uso como GitHub Action: https://github.com/securego/gosec#github-action
+
+**Go**
+- `http.Server` (timeouts): https://pkg.go.dev/net/http#Server
+- `http.ResponseWriter.Write`: https://pkg.go.dev/net/http#ResponseWriter
+- `strconv.Atoi` / `strconv.Itoa`: https://pkg.go.dev/strconv
+- `fmt` (verbos `%d`, `%s`): https://pkg.go.dev/fmt#hdr-Printing
+- Short variable declarations (`:=`): https://go.dev/ref/spec#Short_variable_declarations
+- Error handling and Go: https://go.dev/blog/error-handling-and-go
+- Buenas prácticas de seguridad en Go: https://go.dev/doc/security/best-practices
+- The complete guide to Go net/http timeouts (Cloudflare): https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/
+
+**Seguridad (CWE / OWASP)**
+- CWE-117 Log injection: https://cwe.mitre.org/data/definitions/117.html
+- CWE-400 Uncontrolled resource consumption: https://cwe.mitre.org/data/definitions/400.html
+- CWE-703 Improper handling of exceptional conditions: https://cwe.mitre.org/data/definitions/703.html
+- OWASP Log Injection: https://owasp.org/www-community/attacks/Log_Injection
+- Slowloris: https://en.wikipedia.org/wiki/Slowloris_(computer_security)
+- OWASP Code Review Guide: https://owasp.org/www-project-code-review-guide/
+
+**Herramientas**
+- nano cheatsheet: https://www.nano-editor.org/dist/latest/cheatsheet.html
+- `git rev-parse --show-toplevel`: https://git-scm.com/docs/git-rev-parse#Documentation/git-rev-parse.txt---show-toplevel
+- GitHub — revisiones de PR: https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/reviewing-changes-in-pull-requests/about-pull-request-reviews
+
+---
+
 # ESTADO DEL CURSO
 
 | Sección | Estado |
@@ -2174,9 +2685,10 @@ gh pr checks --repo cecibelauda/learn-cicd-starter --watch   # Style ✅  Tests 
 | 2 — Running Tests | ✅ Completada |
 | 3 — Formatting | ✅ Completada |
 | 4 — Linting | ✅ Completada |
-| 5 — Por confirmar al iniciar | ⏳ Pendiente |
+| 5 — Security | ✅ Completada |
+| 6 — Por confirmar al iniciar | ⏳ Pendiente |
 
-Temas pendientes según el temario inicial: Security y Continuous Deployment. El orden y la numeración se ajustarán a medida que avance el curso.
+Tema pendiente según el temario inicial: Continuous Deployment.
 
 ### Pipeline actual
 
@@ -2186,9 +2698,9 @@ PR hacia main
       ├──► Job "Tests"                    ├──► Job "Style"
       │     ├─ checkout                   │     ├─ checkout
       │     ├─ setup-go                   │     ├─ setup-go
-      │     └─ go test -cover ./...       │     ├─ test -z $(go fmt ./...)
-      │                                   │     ├─ go install staticcheck
-      │                                   │     └─ staticcheck ./...
+      │     ├─ go test -cover ./...       │     ├─ test -z $(go fmt ./...)
+      │     ├─ go install gosec           │     ├─ go install staticcheck
+      │     └─ gosec ./...                │     └─ staticcheck ./...
 ```
 
 ### Ramas y PRs
@@ -2197,22 +2709,15 @@ PR hacia main
 |---|---|---|
 | `addtests` | #1 | ✅ Mergeada a `main` — ciclo cerrado |
 | `formatting` | #2 | ✅ Mergeada a `main` — ciclo cerrado |
-| `linting` | #3 (`linting → main`) | 🟡 Abierto, sin mergear. Checks: Tests ✅ Style ✅ |
+| `linting` | #3, #4 | ✅ Mergeada a `main` — ciclo cerrado |
+| `security` | #5 | ✅ Mergeada a `main` (`11e3175`) — ciclo cerrado |
 | — | bootdotdev#2988 | ❌ Creado por error contra el repo original — cerrado |
 
-Commits de la rama `linting`:
-
-```
-fix: remove unused function
-ci: add staticcheck linting (unused function on purpose)
-```
-
-**Próximo paso:** al iniciar la Sección 5, mergear el PR #3 y crear una rama nueva desde `main` actualizado:
+**Próximo paso:** al iniciar la Sección 6, crear una rama nueva desde `main` actualizado:
 
 ```bash
-gh pr checks 3 --repo cecibelauda/learn-cicd-starter
-gh pr merge 3 --repo cecibelauda/learn-cicd-starter --merge
+cd ~/learn-cicd-starter
 git checkout main
 git pull origin main
-git checkout -b <nombre-rama-seccion-5>
+git checkout -b <nombre-rama-seccion-6>
 ```
