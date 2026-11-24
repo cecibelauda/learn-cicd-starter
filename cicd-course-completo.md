@@ -2,7 +2,7 @@
 
 **Estudiante:** Auda (Cecibel Espinoza)
 **Repositorio:** https://github.com/cecibelauda/learn-cicd-starter
-**Ramas:** `addtests` (PR #1), `formatting` (PR #2), `linting` (PR #3/#4), `security` (PR #5), `build` (PR #7), `auto-build` (PR #8) — todas mergeadas a `main`
+**Ramas:** `addtests` (PR #1), `formatting` (PR #2), `linting` (PR #3/#4), `security` (PR #5), `build` (PR #7), `auto-build` (PR #8), `deploy` (PR #11) — todas mergeadas a `main`
 **Directorio local:** `~/learn-cicd-starter`
 
 ---
@@ -3335,6 +3335,338 @@ git branch -d auto-build
 - `gh pr checks`: https://cli.github.com/manual/gh_pr_checks
 - `gh run watch`: https://cli.github.com/manual/gh_run_watch
 
+# SECCIÓN 7 — Continuous Deployment (Deploy)
+
+## 7.1 Objetivo de la sección
+
+En la Sección 6 el CD llegaba hasta **construir y guardar** la imagen en Artifact Registry, pero nadie la ejecutaba. En la Sección 7 se cierra el ciclo: cada push a `main` termina con la app **publicada en Cloud Run**.
+
+```
+Sección 6:  código ──► CD: build ──► imagen en Artifact Registry
+Sección 7:                                    └──► gcloud run deploy ──► Cloud Run 🌐
+```
+
+**Analogía (panadería):**
+
+| Pieza | Equivale a |
+|---|---|
+| Artifact Registry | El almacén donde se guarda el pan recién horneado (la imagen) |
+| Cloud Run | La vitrina donde el cliente compra el pan (la app pública) |
+| Step `Deploy to Cloud Run` | La cinta transportadora que lleva cada horneada nueva del almacén a la vitrina |
+
+---
+
+## 7.2 Conceptos de Cloud Run
+
+### Servicio vs. revisión
+
+| Concepto | Qué es | Cuándo se crea |
+|---|---|---|
+| **Servicio** | La app pública, con URL fija, región, escalado y acceso | **Una sola vez** (a mano, en la consola) |
+| **Revisión** | Una versión inmutable del servicio: imagen + configuración | **En cada despliegue** |
+
+```
+Servicio "notely"  (misma URL siempre)
+   │
+   ├── Revisión 1  ← creada A MANO en la consola (lección Cloud Run Custom)
+   ├── Revisión 2  ← creada por el CD con gcloud run deploy (lección Cloud Run Updates)
+   ├── Revisión 3  ← siguiente push a main...
+   └── ...          el 100 % del tráfico va a la revisión más nueva
+```
+
+`gcloud run deploy notely` **no crea un servicio nuevo**: crea una revisión nueva del servicio existente. (Si el servicio no existiera, el mismo comando lo crearía: *"Create or update a Cloud Run service"*).
+
+### Orden correcto
+
+```
+1️⃣  Cloud Run Custom   → crear el servicio a mano y validar la URL
+2️⃣  Cloud Run Updates  → el CD actualiza ese servicio en cada push a main
+```
+
+### Imágenes y la etiqueta `latest`
+
+Cada push a `main` genera una imagen nueva (digest distinto). La etiqueta `latest` **se mueve** a la más reciente; las anteriores quedan guardadas sin etiqueta.
+
+```
+Push del PR #7  → imagen 92febe9ee0              (sin etiqueta)
+Push del PR #8  → imagen 0f0359d4f0  [latest]    ← elegida para crear el servicio
+Push del PR #11 → imagen nueva       [latest]    ← desplegada por el CD
+```
+
+---
+
+## 7.3 Lección: Cloud Run Custom (servicio creado en la consola)
+
+Consola → **Cloud Run** → **Services** → **Deploy Container** → `Deploy one revision from an existing container image`.
+
+| Campo | Valor |
+|---|---|
+| Container Image URL | `us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest` (la imagen con etiqueta **latest**) |
+| Name | `notely` |
+| Region | `us-central1` |
+| Authentication | ✅ `Allow public access` |
+| Billing | ✅ `Request-based` (solo se cobra mientras atiende requests) |
+| Service scaling | ✅ `Auto scaling`, máximo **4** instancias |
+| Ingress | ✅ `All` (acceso directo desde internet) |
+
+Después: **Create** → esperar el despliegue → abrir la URL del servicio.
+
+```bash
+# Verificar que el servicio existe
+gcloud run services list --project inner-cinema-511617-v1
+
+# Enviar la lección en Boot.dev
+bootdev config base_url https://notely-xxxxx-uc.a.run.app/
+```
+
+---
+
+## 7.4 Lección: Cloud Run Updates (despliegue automático)
+
+### Step nuevo en el job `deploy`
+
+```yaml
+- name: Deploy to Cloud Run
+  run: gcloud run deploy notely --image us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest --region us-central1 --allow-unauthenticated --project inner-cinema-511617-v1 --max-instances=4
+```
+
+| Placeholder del curso | Valor usado |
+|---|---|
+| `REGION` | `us-central1` |
+| `PROJECT_ID` | `inner-cinema-511617-v1` |
+| `REPO_NAME` | `notely-ar-repo` |
+| `IMAGE:TAG` | `notely:latest` |
+
+### Desglose del comando
+
+| Parte | Para qué sirve |
+|---|---|
+| `gcloud run deploy notely` | Crea una revisión nueva del servicio `notely` |
+| `--image ...:latest` | Imagen a desplegar: la más reciente del registry |
+| `--region us-central1` | Misma región donde vive el servicio |
+| `--allow-unauthenticated` | Mantiene la app pública (rol `run.invoker` para `allUsers`) |
+| `--project` | Proyecto de GCP |
+| `--max-instances=4` | Límite de escalado (y de costo) |
+
+### `cd.yml` final
+
+```yaml
+name: cd
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: "read"
+      id-token: "write"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.1"
+
+      - name: Build the app
+        run: ./scripts/buildprod.sh
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: "projects/728416536675/locations/global/workloadIdentityPools/github/providers/my-repo"
+          service_account: "cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com"
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Build and push Docker image
+        run: gcloud builds submit --tag us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest .
+
+      - name: Deploy to Cloud Run
+        run: gcloud run deploy notely --image us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest --region us-central1 --allow-unauthenticated --project inner-cinema-511617-v1 --max-instances=4
+```
+
+### Permisos que hacen posible el despliegue
+
+La service account `cloud-run-deployer` ya tenía desde la Sección 6 los roles necesarios:
+
+| Rol | Por qué lo necesita este step |
+|---|---|
+| `roles/run.admin` | Crear revisiones y cambiar la política IAM del servicio (`--allow-unauthenticated`) |
+| `roles/iam.serviceAccountUser` | *actAs*: desplegar el servicio con una identidad de ejecución |
+
+### Cambio visible para probar el flujo
+
+`static/index.html`: `<h1>Notely</h1>` → `<h1>Welcome to Notely</h1>`
+
+```bash
+sed -i '' 's|<h1>Notely</h1>|<h1>Welcome to Notely</h1>|' static/index.html   # en Mac: -i ''
+```
+
+Si después del merge la URL muestra **"Welcome to Notely"**, queda demostrado el camino completo: **código → GitHub → CI → merge → build → registry → Cloud Run**.
+
+---
+
+## 7.5 Pipeline completo de CI/CD
+
+```
+PR hacia main ──► CI (Tests + Style) ──► merge a main ──► CD: build ──► Artifact Registry ──► Cloud Run 🌐
+```
+
+**Consecuencia clave:** mergear a `main` = desplegar a producción. Por eso:
+- `main` siempre debe estar estable.
+- Las actualizaciones de este documento van en la rama `docs` (si fueran a `main`, dispararían un despliegue cada vez).
+
+---
+
+## 7.6 Comandos nuevos de la Sección 7
+
+### Cloud Run
+
+```bash
+gcloud run services list --project <PROYECTO>
+gcloud run services describe notely --region us-central1 \
+  --project <PROYECTO> --format='value(status.url)'          # URL del servicio
+gcloud run revisions list --service notely --region us-central1 \
+  --project <PROYECTO>                                       # revisiones y tráfico
+gcloud run deploy notely --image <URL_IMAGEN> --region us-central1 \
+  --allow-unauthenticated --project <PROYECTO> --max-instances=4
+```
+
+### Verificación HTTP
+
+```bash
+curl -s https://notely-xxxxx-uc.a.run.app/ | grep "<h1>"     # <h1>Welcome to Notely</h1>
+```
+
+### IAM (diagnóstico de permisos)
+
+```bash
+gcloud projects get-iam-policy inner-cinema-511617-v1 \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com" \
+  --format="table(bindings.role)"
+```
+
+### Shell (Mac)
+
+```bash
+sed -i '' 's|viejo|nuevo|' archivo      # sed en macOS exige '' tras -i
+```
+
+---
+
+## 7.7 Notas y posibles errores
+
+| Situación | Causa | Solución |
+|---|---|---|
+| ¿Qué imagen elegir al crear el servicio? | Hay varias imágenes en `notely-ar-repo` | La que tiene la etiqueta **`latest`** |
+| El CD no corre en el PR | `cd.yml` escucha `push` a `main` | Normal: se dispara al mergear |
+| `PERMISSION_DENIED ... run.services.get` | Falta `roles/run.admin` en la SA | Agregar el rol a `cloud-run-deployer` |
+| `iam.serviceaccounts.actAs` denied | Falta `roles/iam.serviceAccountUser` | Agregar el rol a `cloud-run-deployer` |
+| `Setting IAM policy failed` con `--allow-unauthenticated` | Sin `run.admin` o la organización restringe `allUsers` | Verificar el rol; el servicio ya era público desde la consola |
+| El navegador sigue mostrando "Notely" | Caché del navegador | `Cmd + Shift + R` o verificar con `curl` |
+| `sed: 1: "static/index.html": invalid command code` | En macOS, `sed -i` espera un sufijo de respaldo | `sed -i '' '...'` |
+
+### Reglas de trabajo consolidadas
+
+1. **El servicio se crea una vez; las revisiones, en cada despliegue.**
+2. **Primero a mano, después automatizar:** validar la configuración en la consola antes de pasarla al CD.
+3. **Merge a `main` = producción.** `main` siempre estable; la documentación vive en `docs`.
+4. **Probar el CD con un cambio visible** (como el `h1`) para confirmar que la nueva revisión está sirviendo.
+5. **Limitar el escalado** (`--max-instances`) y usar facturación *request-based* para controlar costos.
+
+---
+
+## 7.8 Flujo completo ejecutado en la Sección 7
+
+```bash
+# 1. Preparar rama desde main actualizado
+cd ~/learn-cicd-starter
+git checkout main
+git pull origin main
+git checkout -b deploy
+
+# 2. Lección Cloud Run Custom (consola GCP)
+#    Cloud Run → Deploy Container → imagen notely:latest, us-central1,
+#    público, request-based, autoscaling máx. 4, ingress All
+gcloud run services list --project inner-cinema-511617-v1
+bootdev config base_url https://notely-xxxxx-uc.a.run.app/   # Run → Submit
+
+# 3. Lección Cloud Run Updates
+cat > .github/workflows/cd.yml << 'EOF'
+# contenido completo en la sección 7.4
+EOF
+git diff .github/workflows/cd.yml
+grep -n $'\t' .github/workflows/cd.yml                       # sin salida
+sed -i '' 's|<h1>Notely</h1>|<h1>Welcome to Notely</h1>|' static/index.html
+grep -n "<h1>" static/index.html
+go build -o notely && echo "build OK"
+go test -cover ./...
+
+git add .github/workflows/cd.yml static/index.html
+git commit -m "cd: deploy to Cloud Run and update welcome heading"
+git push -u origin deploy
+
+# 4. PR #11 (deploy → main) → Tests ✅ Style ✅ → merge
+gh pr create --repo cecibelauda/learn-cicd-starter \
+  --base main --head deploy --title "Deploy to Cloud Run" \
+  --body "Adds gcloud run deploy step to CD and updates h1"
+gh pr checks <N> --repo cecibelauda/learn-cicd-starter --watch
+gh pr merge <N> --repo cecibelauda/learn-cicd-starter --merge
+
+# 5. CD tras el merge → Deploy ✅ (e440363)
+gh run watch --repo cecibelauda/learn-cicd-starter
+gcloud run revisions list --service notely --region us-central1 \
+  --project inner-cinema-511617-v1
+curl -s https://notely-xxxxx-uc.a.run.app/ | grep "<h1>"      # Welcome to Notely
+bootdev config base_url https://notely-xxxxx-uc.a.run.app/    # Run → Submit
+
+# 6. Sincronizar
+git checkout main
+git pull origin main                                          # e440363 Merge PR #11
+```
+
+Commits de la rama `deploy`:
+
+```
+b5b190e cd: deploy to Cloud Run and update welcome heading
+```
+
+---
+
+## 7.9 Referencias oficiales de la Sección 7
+
+**Cloud Run**
+- Desplegar imágenes de contenedor: https://cloud.google.com/run/docs/deploying
+- Modelo de recursos (servicios y revisiones): https://cloud.google.com/run/docs/resource-model
+- Acceso público (no autenticado): https://cloud.google.com/run/docs/authenticating/public
+- Máximo de instancias: https://cloud.google.com/run/docs/configuring/max-instances-limits
+- Facturación (request-based vs. instance-based): https://cloud.google.com/run/docs/configuring/billing-settings
+- Ingress: https://cloud.google.com/run/docs/securing/ingress
+- Roles IAM de Cloud Run: https://cloud.google.com/run/docs/reference/iam/roles
+
+**gcloud**
+- `gcloud run deploy`: https://cloud.google.com/sdk/gcloud/reference/run/deploy
+- `gcloud run revisions list`: https://cloud.google.com/sdk/gcloud/reference/run/revisions/list
+- `gcloud run services describe`: https://cloud.google.com/sdk/gcloud/reference/run/services/describe
+
+**GitHub Actions**
+- `google-github-actions/deploy-cloudrun`: https://github.com/google-github-actions/deploy-cloudrun
+- Sintaxis de workflows (`on.push.branches`): https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions
+
+**Artifact Registry**
+- Gestionar imágenes y etiquetas: https://cloud.google.com/artifact-registry/docs/docker/manage-images
+
 ---
 
 # ESTADO DEL CURSO
@@ -3347,7 +3679,8 @@ git branch -d auto-build
 | 4 — Linting | ✅ Completada |
 | 5 — Security | ✅ Completada |
 | 6 — Continuous Deployment (Build) | ✅ Completada |
-| 7 — Por confirmar al iniciar | ⏳ Pendiente |
+| 7 — Continuous Deployment (Deploy) | ✅ Completada |
+| 8 — Por confirmar al iniciar | ⏳ Pendiente |
 
 ### Pipeline actual
 
@@ -3369,7 +3702,8 @@ Push a main (cd.yml)
             ├─ ./scripts/buildprod.sh
             ├─ google-github-actions/auth  (WIF)
             ├─ google-github-actions/setup-gcloud
-            └─ gcloud builds submit ──► Artifact Registry (notely:latest)
+            ├─ gcloud builds submit ──► Artifact Registry (notely:latest)
+            └─ gcloud run deploy    ──► Cloud Run (servicio notely, us-central1) 🌐
 ```
 
 ### Ramas y PRs
@@ -3383,6 +3717,7 @@ Push a main (cd.yml)
 | `build` | #6 | ❌ Cerrado sin merge (reemplazado por #7) |
 | `build` | #7 | ✅ Mergeada a `main` (`a2d18d0`) — ciclo cerrado |
 | `auto-build` | #8 | ✅ Mergeada a `main` (`d1889af`) — ciclo cerrado |
+| `deploy` | #11 | ✅ Mergeada a `main` (`e440363`) — ciclo cerrado |
 | — | bootdotdev#2988 | ❌ Creado por error contra el repo original — cerrado |
 
 ### Recursos en GCP (eliminar al terminar el curso)
@@ -3394,6 +3729,7 @@ Push a main (cd.yml)
 | Artifact Registry | `notely-ar-repo` (us-central1) |
 | Service account | `cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com` |
 | WIF | Pool `github` / Provider `my-repo` |
+| Cloud Run | Servicio `notely` (us-central1, público, máx. 4 instancias) |
 
 **Próximo paso:** al iniciar la siguiente sección, crear una rama nueva desde `main` actualizado:
 
@@ -3401,5 +3737,5 @@ Push a main (cd.yml)
 cd ~/learn-cicd-starter
 git checkout main
 git pull origin main
-git checkout -b <nombre-rama-seccion-7>
+git checkout -b <nombre-rama-seccion-8>
 ```
