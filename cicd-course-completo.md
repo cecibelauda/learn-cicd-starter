@@ -2,7 +2,8 @@
 
 **Estudiante:** Auda (Cecibel Espinoza)
 **Repositorio:** https://github.com/cecibelauda/learn-cicd-starter
-**Ramas:** `addtests` (PR #1), `formatting` (PR #2), `linting` (PR #3/#4), `security` (PR #5) — todas mergeadas a `main`
+**Ramas:** `addtests` (PR #1), `formatting` (PR #2), `linting` (PR #3/#4), `security` (PR #5), `build` (PR #7), `auto-build` (PR #8), `deploy` (PR #11), `migrations` (PR #12) — todas mergeadas a `main`
+**Estado:** ✅ Curso completado (27/11/2026)
 **Directorio local:** `~/learn-cicd-starter`
 
 ---
@@ -2677,6 +2678,1662 @@ Commits de la rama `security`:
 
 ---
 
+# SECCIÓN 6 — Continuous Deployment (Build)
+
+## 6.1 CI vs. CD
+
+| | **CI** | **CD** |
+|---|---|---|
+| Pregunta que responde | ¿El código integra bien y es correcto? | ¿Cómo llega ese código a un ambiente real? |
+| Qué produce | Un ✅ / ❌ sobre el cambio | Un artefacto publicado (imagen Docker) y, luego, una app corriendo |
+| Cuándo corre | En cada PR (`pull_request`) | Al mergear (`push` a `main`) |
+| Efecto | No toca ningún ambiente | Cambia lo que existe en la nube |
+
+> **Idea central:** la CI **verifica**; la CD **entrega**. La CI también compila (`go test` y `gosec` compilan internamente), pero el resultado se descarta con el runner.
+
+### Las dos "D"
+
+| Variante | Qué hace |
+|---|---|
+| **Continuous Delivery** | El artefacto queda **listo** para desplegar; una persona aprueba el pase |
+| **Continuous Deployment** | Se despliega a producción **automáticamente** |
+
+🧠 **Analogía — una imprenta:** CI = revisar la prueba de impresión · Delivery = libro empacado en el almacén · Deployment = el camión sale solo a las librerías.
+
+**Equivalencia La Tinka:** CI = `mvn verify` + JaCoCo + SonarQube en el PR · CD = imagen Docker → ECR → EKS. Si el pase a producción requiere aprobación, es **Delivery**.
+
+### CI y CD son workflows independientes
+
+```
+PR abierto   ──► evento pull_request ──► ci.yml  (Tests + Style)
+Merge a main ──► evento push a main  ──► cd.yml  (Deploy)
+```
+
+Por eso en un PR **solo aparecen los checks de CI**: el CD se dispara recién tras el merge.
+
+---
+
+## 6.2 Git: `pull`, `push` y Pull Request
+
+| Comando | Dirección | Qué hace |
+|---|---|---|
+| `git pull origin <rama>` | GitHub → Mac | Baja commits de esa rama remota y los fusiona en la rama **donde estás** |
+| `git push origin <rama>` | Mac → GitHub | Sube los commits de tu rama local a su gemela remota |
+| **Pull Request** | (GitHub) | Propone fusionar una rama en `main`. No tiene relación con el comando `pull` |
+
+```
+        GitHub (origin)                         Tu Mac
+   ┌──────────────────────┐            ┌──────────────────────┐
+   │ main                 │ ──pull──►  │ main                 │
+   │ build                │ ◄──push──  │ build  (estás aquí)  │
+   └──────────────────────┘            └──────────────────────┘
+```
+
+- `push` sube a la rama donde estás, **no** a `main`.
+- `main` en GitHub solo cambia por **PR + Merge**. Nunca `git push origin main`.
+- `-u` se usa una vez para fijar el *upstream*.
+- `-m` cambia de significado: `commit -m` = mensaje; `branch -m` = renombrar (*move*).
+
+---
+
+## 6.3 Docker: construir la imagen localmente
+
+### Archivos del repo
+
+`scripts/buildprod.sh`:
+
+```bash
+#!/bin/bash
+
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o notely
+```
+
+`Dockerfile`:
+
+```dockerfile
+FROM --platform=linux/amd64 debian:stable-slim
+
+RUN apt-get update && apt-get install -y ca-certificates
+
+ADD notely /usr/bin/notely
+
+CMD ["notely"]
+```
+
+| Variable | Efecto |
+|---|---|
+| `GOOS=linux` | Compila para Linux (binario ELF, no Mach-O) |
+| `GOARCH=amd64` | Arquitectura Intel/AMD, la de Cloud Run |
+| `CGO_ENABLED=0` | Binario estático, sin depender de librerías del sistema |
+
+⚠️ **No cambiar a `arm64`** aunque la Mac sea Apple Silicon: Cloud Run corre en amd64. Docker Desktop lo emula con Rosetta.
+
+### Flujo
+
+```
+1. buildprod.sh              2. docker build                   3. docker run
+┌─────────────┐             ┌──────────────────────────┐      ┌──────────────────┐
+│ Código Go   │──go build─► │ debian:stable-slim       │─run─►│ Contenedor       │
+│ (tu Mac)    │ linux/amd64 │ + ca-certificates        │      │ PORT=8080        │
+└─────────────┘     ↓       │ + /usr/bin/notely        │      │ :8080 ◄── tu Mac │
+               binario      │ CMD ["notely"]           │      └──────────────────┘
+               notely (ELF) └──────────────────────────┘
+```
+
+🧠 **Analogía:** binario = comida cocinada · imagen = lonchera con comida y cubiertos · contenedor = lonchera abierta sirviéndose.
+
+```bash
+docker --version                                  # ≥ 20.10.21
+./scripts/buildprod.sh
+file notely                                       # ELF 64-bit ... x86-64 ... statically linked
+docker build -t DOCKERHUB_NAMESPACE/notely:latest .
+docker run -e PORT=8080 -p 8080:8080 DOCKERHUB_NAMESPACE/notely:latest
+# navegador: http://localhost:8080  (http, no https)
+```
+
+| Flag | Significado |
+|---|---|
+| `-t usuario/notely:latest` | Nombre (*tag*) de la imagen |
+| `.` | *Build context*: carpeta con `Dockerfile` y `notely` |
+| `-e PORT=8080` | Variable de entorno dentro del contenedor |
+| `-p 8080:8080` | Puerto de la Mac → puerto del contenedor |
+
+⚠️ **Docker Desktop debe estar abierto:** en Mac, el *daemon* de Docker corre dentro de una VM Linux que levanta Docker Desktop. Sin él: `Cannot connect to the Docker daemon`.
+
+💡 El binario `notely` no corre en la Mac (`exec format error`) y está en `.gitignore`.
+
+---
+
+## 6.4 Workflow de CD inicial (`cd.yml`)
+
+```yaml
+name: cd
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.1"
+
+      - name: Build the app
+        run: ./scripts/buildprod.sh
+```
+
+Diferencia clave con `ci.yml`: el evento es **`push` a `main`**, no `pull_request`.
+
+---
+
+## 6.5 Google Cloud Platform: cuenta, facturación y proyecto
+
+### Jerarquía creada
+
+```
+cecibel-espinoza02-org                (organización, creada automáticamente)
+   ├── notely-billing                 (cuenta de facturación — "Cuenta pagada", sin créditos de prueba)
+   └── Proyecto "notely"              (ID: inner-cinema-511617-v1 · número: 728416536675)
+          ├── Artifact Registry  → notely-ar-repo (us-central1)
+          ├── Cloud Build
+          ├── Service Account    → cloud-run-deployer
+          └── Workload Identity Pool "github" → Provider "my-repo"
+```
+
+| Concepto | Detalle |
+|---|---|
+| **Project** | Agrupa todos los recursos. Al terminar el curso, **borrar el proyecto** limpia todo |
+| **Billing Account** | Donde se registra la tarjeta; debe estar **vinculada** al proyecto |
+| **Project ID vs. número** | `inner-cinema-511617-v1` (nombre) ≠ `728416536675` (número; aparece en IDs de WIF) |
+| **Budget alert** | Recomendado (ej. S/. 10): la cuenta cobra todo lo que exceda el nivel gratuito |
+
+⚠️ La prueba gratuita (USD 300) se da **una sola vez por persona**. La cuenta anterior estaba cerrada y no se podía reabrir, por eso se creó `notely-billing`.
+
+### Google Cloud SDK (`gcloud`)
+
+```bash
+gcloud init                              # login por navegador (OAuth); no requiere SSH
+gcloud config get-value project          # inner-cinema-511617-v1
+gcloud components update                 # opcional
+```
+
+`--console-only` solo hace falta en entornos sin navegador (por ejemplo WSL).
+
+### Equivalencias con AWS
+
+| GCP | AWS |
+|---|---|
+| Project | Cuenta de AWS |
+| Billing Account | Facturación / AWS Organizations |
+| Artifact Registry | ECR |
+| Cloud Build | CodeBuild |
+| Cloud Run | ECS Fargate / App Runner |
+| Service Account | IAM Role |
+
+---
+
+## 6.6 Artifact Registry
+
+Registro **privado** de imágenes Docker en GCP (como Docker Hub, pero privado).
+
+### Configuración realizada
+
+1. Habilitar **Cloud Build API**.
+2. En *Cloud Build → Settings*, habilitar el rol **Cloud Build Service Account** para la cuenta por defecto.
+3. Habilitar **Artifact Registry API**.
+4. Crear repositorio:
+
+| Campo | Valor |
+|---|---|
+| Nombre | `notely-ar-repo` |
+| Formato | Docker |
+| Modo | Standard |
+| Ubicación | Region → `us-central1` |
+| Cifrado | Google-managed encryption key |
+| Análisis de vulnerabilidades | **Desactivado** (cuesta USD 0.26 por imagen) |
+
+5. Construir y subir desde la Mac:
+
+```bash
+gcloud builds submit --tag us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest .
+```
+
+### Anatomía de la URL de imagen
+
+```
+us-central1-docker.pkg.dev / inner-cinema-511617-v1 / notely-ar-repo / notely : latest
+└──── región + host ─────┘  └────── proyecto ─────┘  └ repositorio ─┘ └imagen┘ └ tag ┘
+```
+
+### Dónde ver cada cosa
+
+| Lugar | Qué muestra |
+|---|---|
+| **Cloud Build → Historial** | El *proceso*: logs, éxito/falla, duración |
+| **Artifact Registry → notely-ar-repo → notely** | El *resultado*: versiones de la imagen |
+
+🧠 **Analogía:** Cloud Build es la cocina; Artifact Registry es la vitrina.
+
+### Digest vs. tag
+
+| | Digest (`sha256:92febe9ee084...`) | Tag (`latest`) |
+|---|---|---|
+| ¿Cambia? | **Inmutable**: identifica el contenido exacto | **Móvil**: se mueve a la imagen más nueva |
+| Analogía | El DNI | El "empleado del mes" |
+
+```
+Build 1:  92febe9ee084  ← latest
+Build 2:  92febe9ee084  (sin tag)
+          <digest nuevo> ← latest
+```
+
+La región de las imágenes y la de despliegue no tienen por qué coincidir ([regiones y zonas](https://cloud.google.com/compute/docs/regions-zones)).
+
+---
+
+## 6.7 Workload Identity Federation (WIF)
+
+### El problema
+
+`gcloud builds submit` funciona en la Mac con **tu** cuenta de Google. Desde GitHub Actions se necesita otra identidad, **sin** guardar llaves JSON de larga duración (que hay que esconder y rotar).
+
+**Federación** = un sistema (GCP) confía en una identidad emitida por otro (GitHub), usando **OpenID Connect (OIDC)**.
+
+### Cómo funciona
+
+```
+GitHub Actions (workflow)
+   │ 1. GitHub emite un token OIDC firmado
+   │    { repository: "cecibelauda/learn-cicd-starter", ref: "refs/heads/main", ... }
+   ▼
+google-github-actions/auth ──2. token + "quiero ser Cloud Run Deployer"──► GCP
+                                                                            │
+                     Pool "github" → Provider "my-repo"                     │
+                       ├─ ¿firma de GitHub? (issuer-uri)              ✅    │
+                       ├─ ¿es mi repo? (attribute-condition)          ✅    │
+                       └─ ¿puede suplantar a la service account?      ✅    │
+   ◄────────────── 3. credenciales temporales (~1 hora) ────────────────────┘
+   ▼
+4. gcloud builds submit con los permisos de "Cloud Run Deployer"
+```
+
+| Pieza | Función |
+|---|---|
+| **Workload identity pool** | Agrupa identidades externas |
+| **Workload identity provider** | Define cómo verificar tokens de un emisor (GitHub) y qué condiciones aceptar |
+| **Attribute mapping** | Convierte *claims* del token (`assertion.repository`) en atributos de IAM |
+| **Attribute condition** | Solo acepta tokens de **tu** repo, no de cualquier workflow de GitHub |
+| **`roles/iam.workloadIdentityUser`** | Permite a esas identidades **suplantar** a la service account |
+
+🧠 **Analogía — pase de visitante:** token OIDC = DNI de tu empresa · provider = guardia que verifica el DNI y la empresa · pool = lista de empresas con convenio · service account = rol "técnico de mantenimiento" · credencial temporal = pase que vence al final del día · llave JSON = copia permanente de la llave del edificio (lo que se evita).
+
+### Equivalencia AWS
+
+| GCP | AWS |
+|---|---|
+| Workload Identity Federation | IAM OIDC Identity Provider + `AssumeRoleWithWebIdentity` |
+| Service Account | IAM Role |
+| `roles/iam.workloadIdentityUser` | *Trust policy* del rol |
+| `google-github-actions/auth` | `aws-actions/configure-aws-credentials` |
+| `attribute-condition` | Condición `token.actions.githubusercontent.com:sub` |
+
+### Service account "Cloud Run Deployer"
+
+Email: `cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com`
+
+| Rol (lección) | Nombre en consola (español) | ID |
+|---|---|---|
+| Cloud Build Editor | Editor de Cloud Build | `roles/cloudbuild.builds.editor` |
+| Cloud Build Service Account | Cuenta de servicio de Cloud Build | `roles/cloudbuild.builds.builder` |
+| Cloud Run Admin | Administrador de Cloud Run | `roles/run.admin` |
+| Service Account User | Usuario de cuenta de servicio | `roles/iam.serviceAccountUser` |
+| Viewer | Visualizador (categoría **Básico**) | `roles/viewer` |
+
+⚠️ "Visualizador de Vertex AI" u otros "Visualizador de X" **no** son `roles/viewer`.
+
+En la consola es un rol por fila (**+ Agregar otro rol**). Alternativa con `gcloud`:
+
+```bash
+GCP_PROJECT_ID="$(gcloud config get-value project)"
+SA="cloud-run-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+
+for ROLE in roles/cloudbuild.builds.editor roles/cloudbuild.builds.builder \
+            roles/run.admin roles/iam.serviceAccountUser roles/viewer; do
+  gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:${SA}" --role="$ROLE" --condition=None
+done
+```
+
+### APIs habilitadas para WIF
+
+- Identity and Access Management (IAM) API
+- Cloud Resource Manager API
+- IAM Service Account Credentials API
+- Security Token Service API
+
+### Comandos de configuración (desde la raíz del repo)
+
+```bash
+GCP_PROJECT_ID="$(gcloud config get-value project)"
+GCP_SERVICE_ACCOUNT_EMAIL="cloud-run-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+GITHUB_REPO="$(git remote get-url origin | sed -E 's#.*github.com[:/]##; s#\.git$##')"
+
+gcloud iam workload-identity-pools create "github" \
+  --location="global" \
+  --display-name="GitHub Actions Pool"
+
+gcloud iam workload-identity-pools providers create-oidc "my-repo" \
+  --location="global" \
+  --workload-identity-pool="github" \
+  --display-name="My GitHub repo Provider" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
+  --attribute-condition="assertion.repository == '${GITHUB_REPO}'" \
+  --issuer-uri="https://token.actions.githubusercontent.com"
+
+export WORKLOAD_IDENTITY_POOL="$(
+  gcloud iam workload-identity-pools describe "github" \
+    --location="global" \
+    --format="value(name)"
+)"
+
+gcloud iam service-accounts add-iam-policy-binding \
+  ${GCP_SERVICE_ACCOUNT_EMAIL} \
+  --role=roles/iam.workloadIdentityUser \
+  --member="principalSet://iam.googleapis.com/${WORKLOAD_IDENTITY_POOL}/attribute.repository/${GITHUB_REPO}"
+```
+
+"Raíz del repo" = `/Users/Cecibel/learn-cicd-starter` (con guiones). Es necesario porque `git remote get-url origin` solo funciona dentro del repo.
+
+---
+
+## 6.8 Automate Builds — CD completo hacia Artifact Registry
+
+### ID del provider
+
+```bash
+gcloud iam workload-identity-pools providers describe "my-repo" \
+  --location="global" \
+  --workload-identity-pool="github" \
+  --format="value(name)"
+# projects/728416536675/locations/global/workloadIdentityPools/github/providers/my-repo
+```
+
+Empieza con el **número** del proyecto, no con el ID.
+
+### Workflow final: `.github/workflows/cd.yml`
+
+```yaml
+name: cd
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: "read"
+      id-token: "write"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.1"
+
+      - name: Build the app
+        run: ./scripts/buildprod.sh
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: "projects/728416536675/locations/global/workloadIdentityPools/github/providers/my-repo"
+          service_account: "cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com"
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Build and push Docker image
+        run: gcloud builds submit --tag us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest .
+```
+
+| Bloque | Para qué |
+|---|---|
+| `permissions.id-token: write` | Permite que el job **pida el token OIDC**; sin esto, `auth` falla |
+| `permissions.contents: read` | Al declarar `permissions` se pierden los permisos por defecto; `checkout` necesita leer el repo |
+| `auth@v3` | Intercambia el token OIDC por credenciales temporales (WIF) |
+| `setup-gcloud@v3` | Instala la CLI `gcloud` en el runner, ya autenticada |
+| `gcloud builds submit` | Construye en Cloud Build y sube a Artifact Registry |
+
+### Flujo resultante
+
+```
+merge PR #8 ──► push a main ──► cd.yml (Deploy, ~1m 15s)
+                                  ├─ checkout
+                                  ├─ setup-go
+                                  ├─ buildprod.sh
+                                  ├─ auth (WIF: token OIDC → credenciales temporales)
+                                  ├─ setup-gcloud
+                                  └─ gcloud builds submit ──► Artifact Registry (notely:latest)
+```
+
+### Antes vs. ahora
+
+| | Lección Artifact Registry | Automate Builds |
+|---|---|---|
+| ¿Quién construye? | Tú, desde la Mac | GitHub Actions |
+| ¿Con qué identidad? | Tu cuenta de Google | Service account Cloud Run Deployer |
+| ¿Cuándo? | Manualmente | En cada merge a `main` |
+| ¿Llaves guardadas en GitHub? | — | **Ninguna** |
+
+### Verificación
+
+```bash
+gh run list --repo cecibelauda/learn-cicd-starter --workflow cd.yml --limit 3
+gh run watch --repo cecibelauda/learn-cicd-starter
+gcloud artifacts docker images list \
+  us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely \
+  --include-tags --sort-by=~CREATE_TIME --limit=2
+```
+
+El "1 notice" en *Annotations* del run es informativo, no un error.
+
+---
+
+## 6.9 Comandos nuevos de la Sección 6
+
+### Docker
+
+```bash
+docker --version
+docker info --format '{{.OSType}}/{{.Architecture}}'
+docker build -t usuario/notely:latest .
+docker images | grep notely
+docker image inspect usuario/notely:latest --format '{{.Os}}/{{.Architecture}}'
+docker run -e PORT=8080 -p 8080:8080 usuario/notely:latest
+file notely                                  # ELF (Linux) vs Mach-O (Mac)
+```
+
+### gcloud
+
+```bash
+gcloud init
+gcloud config get-value project
+gcloud components update
+gcloud builds submit --tag <URL_IMAGEN> .
+gcloud artifacts docker images list <REPO_O_IMAGEN> --include-tags
+gcloud iam service-accounts list --format="value(email)"
+gcloud projects add-iam-policy-binding <PROYECTO> --member=... --role=...
+gcloud projects get-iam-policy <PROYECTO> --flatten="bindings[].members" \
+  --filter="bindings.members:<SA>" --format="value(bindings.role)"
+gcloud iam workload-identity-pools create ...
+gcloud iam workload-identity-pools providers create-oidc ...
+gcloud iam workload-identity-pools providers describe ... --format="value(name)"
+gcloud iam service-accounts add-iam-policy-binding ...
+```
+
+### Git y GitHub CLI
+
+```bash
+git branch -m cd build                        # renombrar rama (conserva cambios)
+git rev-parse --show-toplevel                 # raíz del repo
+gh pr list --repo OWNER/REPO --state all --json number,title,state,mergedAt
+gh pr checks <N> --repo OWNER/REPO --watch    # con --repo, el número es obligatorio
+gh pr merge <N> --repo OWNER/REPO --merge
+gh run list --repo OWNER/REPO --workflow cd.yml --limit 3
+gh run watch --repo OWNER/REPO
+gh run view --repo OWNER/REPO --log-failed
+```
+
+---
+
+## 6.10 Notas y errores encontrados
+
+| Situación | Causa | Solución |
+|---|---|---|
+| En el PR solo aparecen checks de CI, no de CD | `cd.yml` escucha `push` a `main` | Normal: el CD corre tras el merge |
+| `Cannot connect to the Docker daemon` | Docker Desktop cerrado | Abrir Docker Desktop (hospeda la VM Linux del daemon) |
+| `./notely` → `exec format error` en la Mac | Binario compilado para linux/amd64 | Es solo para el contenedor; no cambiar a arm64 |
+| La cuenta de facturación anterior no se podía reabrir | Prueba gratuita ya usada / cuenta cerrada | Crear `notely-billing` (cuenta pagada) + alerta de presupuesto |
+| Banner "Activa el análisis de vulnerabilidades" | Oferta paga (USD 0.26/imagen) | Cerrar con X; no activar |
+| "Visualizador de IA" en lugar de Viewer | Rol predefinido de otro servicio | Categoría **Básico** → **Visualizador** (`roles/viewer`) |
+| No se pueden elegir varios roles en un desplegable | La consola asigna un rol por fila | **+ Agregar otro rol**, o loop con `gcloud` |
+| `gh pr list` sin columna de estado | La vista por defecto no muestra MERGED/CLOSED | `--json number,title,state,mergedAt` |
+| `argument required when using the --repo flag` | `gh pr checks --repo` sin número de PR | `gh pr checks 8 --repo ...` |
+| `gh run list` no mostraba el run nuevo tras el merge | GitHub tarda segundos en disparar el workflow | `sleep 10` y volver a listar |
+| Rama `build` ya mergeada al retomar | PR #7 mergeado el 14/10 | Rama nueva `auto-build` desde `main` actualizado |
+
+### Reglas de trabajo consolidadas
+
+1. **CI verifica, CD entrega.** Son workflows separados con eventos distintos.
+2. **Nunca `git push origin main`.** `main` solo cambia por PR + Merge.
+3. **Compilar para la arquitectura de destino** (Cloud Run = linux/amd64), no la de la Mac.
+4. **Sin llaves de larga duración en CI:** usar WIF/OIDC con credenciales temporales.
+5. **Restringir el provider a tu repo** (`attribute-condition`); nunca confiar en todo GitHub.
+6. **Mínimo privilegio:** la service account solo tiene los roles que necesita.
+7. **Controlar costos:** alerta de presupuesto, sin escaneos pagos, y borrar el proyecto `notely` al terminar.
+
+---
+
+## 6.11 Flujo completo ejecutado en la Sección 6
+
+```bash
+# 1. Preparar rama (se renombró cd → build)
+cd ~/learn-cicd-starter
+git branch -m cd build
+
+# 2. Lección Docker
+./scripts/buildprod.sh
+docker build -t DOCKERHUB_NAMESPACE/notely:latest .
+docker run -e PORT=8080 -p 8080:8080 DOCKERHUB_NAMESPACE/notely:latest
+
+# 3. Lección CD: crear .github/workflows/cd.yml (sección 6.4)
+git add .github/workflows/cd.yml
+git commit -m "..."
+git push -u origin build
+# PR #7 (build → main) → solo CI ✅ → merge (14/10)
+
+# 4. GCP: cuenta de facturación notely-billing, proyecto notely,
+#    gcloud init (sección 6.5)
+
+# 5. Artifact Registry (sección 6.6)
+gcloud config get-value project              # inner-cinema-511617-v1
+gcloud builds submit --tag us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest .
+
+# 6. WIF: service account + APIs + pool + provider + binding (sección 6.7)
+
+# 7. Automate Builds
+gh pr list --repo cecibelauda/learn-cicd-starter --state all --limit 3 --json number,title,state,mergedAt
+git checkout main
+git pull origin main
+git checkout -b auto-build
+cat > .github/workflows/cd.yml << 'EOF2'
+# contenido completo en la sección 6.8
+EOF2
+git diff .github/workflows/cd.yml
+grep -n $'\t' .github/workflows/cd.yml
+git add .github/workflows/cd.yml
+git commit -m "cd: build and push Docker image to Artifact Registry"
+git push -u origin auto-build
+gh pr create --repo cecibelauda/learn-cicd-starter \
+  --base main --head auto-build \
+  --title "Automate Docker builds" \
+  --body "Authenticates to GCP via WIF and pushes the image to Artifact Registry"
+# PR #8 → Tests ✅ Style ✅
+gh pr merge 8 --repo cecibelauda/learn-cicd-starter --merge
+sleep 10
+gh run list --repo cecibelauda/learn-cicd-starter --workflow cd.yml --limit 3
+# cd: Merge pull request #8 → Deploy ✅ (d1889af)
+
+# 8. Sincronizar y limpiar
+git checkout main
+git pull origin main
+git branch -d auto-build
+```
+
+---
+
+## 6.12 Referencias oficiales de la Sección 6
+
+**CI/CD**
+- About continuous integration: https://docs.github.com/en/actions/about-github-actions/about-continuous-integration-with-github-actions
+- About continuous deployment: https://docs.github.com/en/actions/about-github-actions/about-continuous-deployment-with-github-actions
+- CI vs. Delivery vs. Deployment (Atlassian): https://www.atlassian.com/continuous-delivery/principles/continuous-integration-vs-delivery-vs-deployment
+- Eventos que disparan workflows: https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows
+
+**Docker y Go**
+- `docker build`: https://docs.docker.com/reference/cli/docker/buildx/build/
+- `docker run`: https://docs.docker.com/reference/cli/docker/container/run/
+- `GOOS` / `GOARCH`: https://go.dev/doc/install/source#environment
+- Digests de imágenes: https://docs.docker.com/reference/cli/docker/image/pull/#pull-an-image-by-digest-immutable-identifier
+
+**Google Cloud**
+- Programa gratuito: https://cloud.google.com/free/docs/free-cloud-features
+- Crear y administrar proyectos: https://cloud.google.com/resource-manager/docs/creating-managing-projects
+- Crear cuenta de facturación: https://cloud.google.com/billing/docs/how-to/create-billing-account
+- Alertas de presupuesto: https://cloud.google.com/billing/docs/how-to/budgets
+- Instalar gcloud CLI: https://cloud.google.com/sdk/docs/install
+- Artifact Registry: https://cloud.google.com/artifact-registry/docs/overview
+- Crear repositorios Docker: https://cloud.google.com/artifact-registry/docs/repositories/create-repos
+- Administrar imágenes: https://cloud.google.com/artifact-registry/docs/docker/manage-images
+- `gcloud builds submit`: https://cloud.google.com/sdk/gcloud/reference/builds/submit
+- Ver resultados de Cloud Build: https://cloud.google.com/build/docs/view-build-results
+- Regiones y zonas: https://cloud.google.com/compute/docs/regions-zones
+- Roles básicos: https://cloud.google.com/iam/docs/roles-overview#basic
+- Roles de Cloud Build: https://cloud.google.com/build/docs/iam-roles-permissions
+- Roles de Cloud Run: https://cloud.google.com/run/docs/reference/iam/roles
+
+**Workload Identity Federation / OIDC**
+- WIF (visión general): https://cloud.google.com/iam/docs/workload-identity-federation
+- WIF con pipelines de despliegue: https://cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines
+- OIDC en GitHub Actions: https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect
+- Configurar OIDC en Google Cloud: https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-google-cloud-platform
+- `google-github-actions/auth`: https://github.com/google-github-actions/auth
+- `google-github-actions/setup-gcloud`: https://github.com/google-github-actions/setup-gcloud
+- Sintaxis de `permissions`: https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#permissions
+
+**Git / GitHub CLI**
+- `git pull`: https://git-scm.com/docs/git-pull
+- `git push`: https://git-scm.com/docs/git-push
+- GitHub Flow: https://docs.github.com/en/get-started/using-github/github-flow
+- `gh pr list`: https://cli.github.com/manual/gh_pr_list
+- `gh pr checks`: https://cli.github.com/manual/gh_pr_checks
+- `gh run watch`: https://cli.github.com/manual/gh_run_watch
+
+# SECCIÓN 7 — Continuous Deployment (Deploy)
+
+## 7.1 Objetivo de la sección
+
+En la Sección 6 el CD llegaba hasta **construir y guardar** la imagen en Artifact Registry, pero nadie la ejecutaba. En la Sección 7 se cierra el ciclo: cada push a `main` termina con la app **publicada en Cloud Run**.
+
+```
+Sección 6:  código ──► CD: build ──► imagen en Artifact Registry
+Sección 7:                                    └──► gcloud run deploy ──► Cloud Run 🌐
+```
+
+**Analogía (panadería):**
+
+| Pieza | Equivale a |
+|---|---|
+| Artifact Registry | El almacén donde se guarda el pan recién horneado (la imagen) |
+| Cloud Run | La vitrina donde el cliente compra el pan (la app pública) |
+| Step `Deploy to Cloud Run` | La cinta transportadora que lleva cada horneada nueva del almacén a la vitrina |
+
+---
+
+## 7.2 Conceptos de Cloud Run
+
+### Servicio vs. revisión
+
+| Concepto | Qué es | Cuándo se crea |
+|---|---|---|
+| **Servicio** | La app pública, con URL fija, región, escalado y acceso | **Una sola vez** (a mano, en la consola) |
+| **Revisión** | Una versión inmutable del servicio: imagen + configuración | **En cada despliegue** |
+
+```
+Servicio "notely"  (misma URL siempre)
+   │
+   ├── Revisión 1  ← creada A MANO en la consola (lección Cloud Run Custom)
+   ├── Revisión 2  ← creada por el CD con gcloud run deploy (lección Cloud Run Updates)
+   ├── Revisión 3  ← siguiente push a main...
+   └── ...          el 100 % del tráfico va a la revisión más nueva
+```
+
+`gcloud run deploy notely` **no crea un servicio nuevo**: crea una revisión nueva del servicio existente. (Si el servicio no existiera, el mismo comando lo crearía: *"Create or update a Cloud Run service"*).
+
+### Orden correcto
+
+```
+1️⃣  Cloud Run Custom   → crear el servicio a mano y validar la URL
+2️⃣  Cloud Run Updates  → el CD actualiza ese servicio en cada push a main
+```
+
+### Imágenes y la etiqueta `latest`
+
+Cada push a `main` genera una imagen nueva (digest distinto). La etiqueta `latest` **se mueve** a la más reciente; las anteriores quedan guardadas sin etiqueta.
+
+```
+Push del PR #7  → imagen 92febe9ee0              (sin etiqueta)
+Push del PR #8  → imagen 0f0359d4f0  [latest]    ← elegida para crear el servicio
+Push del PR #11 → imagen nueva       [latest]    ← desplegada por el CD
+```
+
+---
+
+## 7.3 Lección: Cloud Run Custom (servicio creado en la consola)
+
+Consola → **Cloud Run** → **Services** → **Deploy Container** → `Deploy one revision from an existing container image`.
+
+| Campo | Valor |
+|---|---|
+| Container Image URL | `us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest` (la imagen con etiqueta **latest**) |
+| Name | `notely` |
+| Region | `us-central1` |
+| Authentication | ✅ `Allow public access` |
+| Billing | ✅ `Request-based` (solo se cobra mientras atiende requests) |
+| Service scaling | ✅ `Auto scaling`, máximo **4** instancias |
+| Ingress | ✅ `All` (acceso directo desde internet) |
+
+Después: **Create** → esperar el despliegue → abrir la URL del servicio.
+
+```bash
+# Verificar que el servicio existe
+gcloud run services list --project inner-cinema-511617-v1
+
+# Enviar la lección en Boot.dev
+bootdev config base_url https://notely-xxxxx-uc.a.run.app/
+```
+
+---
+
+## 7.4 Lección: Cloud Run Updates (despliegue automático)
+
+### Step nuevo en el job `deploy`
+
+```yaml
+- name: Deploy to Cloud Run
+  run: gcloud run deploy notely --image us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest --region us-central1 --allow-unauthenticated --project inner-cinema-511617-v1 --max-instances=4
+```
+
+| Placeholder del curso | Valor usado |
+|---|---|
+| `REGION` | `us-central1` |
+| `PROJECT_ID` | `inner-cinema-511617-v1` |
+| `REPO_NAME` | `notely-ar-repo` |
+| `IMAGE:TAG` | `notely:latest` |
+
+### Desglose del comando
+
+| Parte | Para qué sirve |
+|---|---|
+| `gcloud run deploy notely` | Crea una revisión nueva del servicio `notely` |
+| `--image ...:latest` | Imagen a desplegar: la más reciente del registry |
+| `--region us-central1` | Misma región donde vive el servicio |
+| `--allow-unauthenticated` | Mantiene la app pública (rol `run.invoker` para `allUsers`) |
+| `--project` | Proyecto de GCP |
+| `--max-instances=4` | Límite de escalado (y de costo) |
+
+### `cd.yml` final
+
+```yaml
+name: cd
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: "read"
+      id-token: "write"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.1"
+
+      - name: Build the app
+        run: ./scripts/buildprod.sh
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: "projects/728416536675/locations/global/workloadIdentityPools/github/providers/my-repo"
+          service_account: "cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com"
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Build and push Docker image
+        run: gcloud builds submit --tag us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest .
+
+      - name: Deploy to Cloud Run
+        run: gcloud run deploy notely --image us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest --region us-central1 --allow-unauthenticated --project inner-cinema-511617-v1 --max-instances=4
+```
+
+### Permisos que hacen posible el despliegue
+
+La service account `cloud-run-deployer` ya tenía desde la Sección 6 los roles necesarios:
+
+| Rol | Por qué lo necesita este step |
+|---|---|
+| `roles/run.admin` | Crear revisiones y cambiar la política IAM del servicio (`--allow-unauthenticated`) |
+| `roles/iam.serviceAccountUser` | *actAs*: desplegar el servicio con una identidad de ejecución |
+
+### Cambio visible para probar el flujo
+
+`static/index.html`: `<h1>Notely</h1>` → `<h1>Welcome to Notely</h1>`
+
+```bash
+sed -i '' 's|<h1>Notely</h1>|<h1>Welcome to Notely</h1>|' static/index.html   # en Mac: -i ''
+```
+
+Si después del merge la URL muestra **"Welcome to Notely"**, queda demostrado el camino completo: **código → GitHub → CI → merge → build → registry → Cloud Run**.
+
+---
+
+## 7.5 Pipeline completo de CI/CD
+
+```
+PR hacia main ──► CI (Tests + Style) ──► merge a main ──► CD: build ──► Artifact Registry ──► Cloud Run 🌐
+```
+
+**Consecuencia clave:** mergear a `main` = desplegar a producción. Por eso:
+- `main` siempre debe estar estable.
+- Las actualizaciones de este documento van en la rama `docs` (si fueran a `main`, dispararían un despliegue cada vez).
+
+---
+
+## 7.6 Comandos nuevos de la Sección 7
+
+### Cloud Run
+
+```bash
+gcloud run services list --project <PROYECTO>
+gcloud run services describe notely --region us-central1 \
+  --project <PROYECTO> --format='value(status.url)'          # URL del servicio
+gcloud run revisions list --service notely --region us-central1 \
+  --project <PROYECTO>                                       # revisiones y tráfico
+gcloud run deploy notely --image <URL_IMAGEN> --region us-central1 \
+  --allow-unauthenticated --project <PROYECTO> --max-instances=4
+```
+
+### Verificación HTTP
+
+```bash
+curl -s https://notely-xxxxx-uc.a.run.app/ | grep "<h1>"     # <h1>Welcome to Notely</h1>
+```
+
+### IAM (diagnóstico de permisos)
+
+```bash
+gcloud projects get-iam-policy inner-cinema-511617-v1 \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com" \
+  --format="table(bindings.role)"
+```
+
+### Shell (Mac)
+
+```bash
+sed -i '' 's|viejo|nuevo|' archivo      # sed en macOS exige '' tras -i
+```
+
+---
+
+## 7.7 Notas y posibles errores
+
+| Situación | Causa | Solución |
+|---|---|---|
+| ¿Qué imagen elegir al crear el servicio? | Hay varias imágenes en `notely-ar-repo` | La que tiene la etiqueta **`latest`** |
+| El CD no corre en el PR | `cd.yml` escucha `push` a `main` | Normal: se dispara al mergear |
+| `PERMISSION_DENIED ... run.services.get` | Falta `roles/run.admin` en la SA | Agregar el rol a `cloud-run-deployer` |
+| `iam.serviceaccounts.actAs` denied | Falta `roles/iam.serviceAccountUser` | Agregar el rol a `cloud-run-deployer` |
+| `Setting IAM policy failed` con `--allow-unauthenticated` | Sin `run.admin` o la organización restringe `allUsers` | Verificar el rol; el servicio ya era público desde la consola |
+| El navegador sigue mostrando "Notely" | Caché del navegador | `Cmd + Shift + R` o verificar con `curl` |
+| `sed: 1: "static/index.html": invalid command code` | En macOS, `sed -i` espera un sufijo de respaldo | `sed -i '' '...'` |
+
+### Reglas de trabajo consolidadas
+
+1. **El servicio se crea una vez; las revisiones, en cada despliegue.**
+2. **Primero a mano, después automatizar:** validar la configuración en la consola antes de pasarla al CD.
+3. **Merge a `main` = producción.** `main` siempre estable; la documentación vive en `docs`.
+4. **Probar el CD con un cambio visible** (como el `h1`) para confirmar que la nueva revisión está sirviendo.
+5. **Limitar el escalado** (`--max-instances`) y usar facturación *request-based* para controlar costos.
+
+---
+
+## 7.8 Flujo completo ejecutado en la Sección 7
+
+```bash
+# 1. Preparar rama desde main actualizado
+cd ~/learn-cicd-starter
+git checkout main
+git pull origin main
+git checkout -b deploy
+
+# 2. Lección Cloud Run Custom (consola GCP)
+#    Cloud Run → Deploy Container → imagen notely:latest, us-central1,
+#    público, request-based, autoscaling máx. 4, ingress All
+gcloud run services list --project inner-cinema-511617-v1
+bootdev config base_url https://notely-xxxxx-uc.a.run.app/   # Run → Submit
+
+# 3. Lección Cloud Run Updates
+cat > .github/workflows/cd.yml << 'EOF'
+# contenido completo en la sección 7.4
+EOF
+git diff .github/workflows/cd.yml
+grep -n $'\t' .github/workflows/cd.yml                       # sin salida
+sed -i '' 's|<h1>Notely</h1>|<h1>Welcome to Notely</h1>|' static/index.html
+grep -n "<h1>" static/index.html
+go build -o notely && echo "build OK"
+go test -cover ./...
+
+git add .github/workflows/cd.yml static/index.html
+git commit -m "cd: deploy to Cloud Run and update welcome heading"
+git push -u origin deploy
+
+# 4. PR #11 (deploy → main) → Tests ✅ Style ✅ → merge
+gh pr create --repo cecibelauda/learn-cicd-starter \
+  --base main --head deploy --title "Deploy to Cloud Run" \
+  --body "Adds gcloud run deploy step to CD and updates h1"
+gh pr checks <N> --repo cecibelauda/learn-cicd-starter --watch
+gh pr merge <N> --repo cecibelauda/learn-cicd-starter --merge
+
+# 5. CD tras el merge → Deploy ✅ (e440363)
+gh run watch --repo cecibelauda/learn-cicd-starter
+gcloud run revisions list --service notely --region us-central1 \
+  --project inner-cinema-511617-v1
+curl -s https://notely-xxxxx-uc.a.run.app/ | grep "<h1>"      # Welcome to Notely
+bootdev config base_url https://notely-xxxxx-uc.a.run.app/    # Run → Submit
+
+# 6. Sincronizar
+git checkout main
+git pull origin main                                          # e440363 Merge PR #11
+```
+
+Commits de la rama `deploy`:
+
+```
+b5b190e cd: deploy to Cloud Run and update welcome heading
+```
+
+---
+
+## 7.9 Referencias oficiales de la Sección 7
+
+**Cloud Run**
+- Desplegar imágenes de contenedor: https://cloud.google.com/run/docs/deploying
+- Modelo de recursos (servicios y revisiones): https://cloud.google.com/run/docs/resource-model
+- Acceso público (no autenticado): https://cloud.google.com/run/docs/authenticating/public
+- Máximo de instancias: https://cloud.google.com/run/docs/configuring/max-instances-limits
+- Facturación (request-based vs. instance-based): https://cloud.google.com/run/docs/configuring/billing-settings
+- Ingress: https://cloud.google.com/run/docs/securing/ingress
+- Roles IAM de Cloud Run: https://cloud.google.com/run/docs/reference/iam/roles
+
+**gcloud**
+- `gcloud run deploy`: https://cloud.google.com/sdk/gcloud/reference/run/deploy
+- `gcloud run revisions list`: https://cloud.google.com/sdk/gcloud/reference/run/revisions/list
+- `gcloud run services describe`: https://cloud.google.com/sdk/gcloud/reference/run/services/describe
+
+**GitHub Actions**
+- `google-github-actions/deploy-cloudrun`: https://github.com/google-github-actions/deploy-cloudrun
+- Sintaxis de workflows (`on.push.branches`): https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions
+
+**Artifact Registry**
+- Gestionar imágenes y etiquetas: https://cloud.google.com/artifact-registry/docs/docker/manage-images
+
+---
+
+---
+
+# SECCIÓN 8 — Database
+
+## 8.1 Objetivo de la sección
+
+Hasta la Sección 7, Notely estaba publicada en Cloud Run, pero **sin base de datos**: la página cargaba, pero no se podían crear usuarios ni notas. En la Sección 8 se conecta la app a una BD en la nube y se integran las **migraciones** al pipeline de CD.
+
+```
+Sección 7:  Cloud Run 🌐  (sin BD → solo HTML estático)
+Sección 8:  Cloud Run 🌐 ──DATABASE_URL (Secret Manager)──► Turso (libsql)
+                 ▲
+CD:  build ──► Artifact Registry ──► goose (migraciones) ──► gcloud run deploy
+```
+
+| Lección | Qué se hizo |
+|---|---|
+| Turso | Crear la BD `notely-db` e instalar el CLI |
+| Migrations | Crear el esquema (`users`, `notes`) con goose desde la Mac |
+| Migrate Automatically | Ejecutar las migraciones en el CD (secreto de GitHub + goose en el runner) |
+| Using the DB | Pasar `DATABASE_URL` a Cloud Run desde Secret Manager |
+
+---
+
+## 8.2 Lección: Turso
+
+### ¿Qué es Turso?
+
+[Turso](https://turso.tech/) es un proveedor cloud de bases de datos *serverless* tipo [SQLite](https://www.sqlite.org/). Técnicamente usa su propio **fork** de SQLite, llamado [libsql](https://github.com/tursodatabase/libsql). Tiene un plan gratuito generoso.
+
+### ¿Qué es un fork?
+
+Un **fork** es una copia independiente de un proyecto que sigue su propio camino.
+
+🧠 **Analogía:** copias la receta de ají de gallina de tu mamá y le haces tus cambios. La original sigue igual; la tuya ya es otra versión.
+
+```
+SQLite (original)
+  ├── v3.40 ── v3.41 ── v3.42 ── ...        ← SQLite sigue su camino
+  └──► FORK: libsql (Turso)
+         └── + acceso por red / serverless
+             + replicación                   ← libsql sigue el suyo
+```
+
+| | Fork | Clone |
+|---|---|---|
+| Dónde queda la copia | En tu cuenta de GitHub (remoto) | En tu Mac (local) |
+| Para qué sirve | Tener tu propia versión del proyecto | Trabajar el código en tu máquina |
+
+### Instalación del CLI (Mac)
+
+```bash
+brew install tursodatabase/tap/turso
+```
+
+Con las versiones nuevas de Homebrew, la dependencia `sqld` vive en otro *tap* que hay que agregar y marcar como confiable:
+
+```bash
+brew tap libsql/sqld
+brew trust libsql/sqld                 # o: brew trust --formula libsql/sqld/sqld
+brew install tursodatabase/tap/turso
+turso --version
+which turso                            # /opt/homebrew/bin/turso
+```
+
+### Comandos de la lección
+
+```bash
+turso auth login                       # abre el navegador
+turso db create notely-db              # si no se creó en el onboarding
+turso db list
+turso db shell notely-db
+```
+
+```sql
+SELECT sqlite_version();
+CREATE TABLE test (id INT, name TEXT);
+SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;
+DROP TABLE test;
+-- salir con Ctrl+C
+```
+
+El shell SQL sirve para **depurar a mano**; el servidor se conecta desde el código.
+
+### Equivalencia con el stack de La Tinka
+
+| Turso | Oracle 19c on-premise |
+|---|---|
+| `turso db shell notely-db` | SQL*Plus / SQL Developer |
+| `libsql://...?authToken=...` | JDBC URL + usuario/contraseña |
+| `turso db tokens create` | Credencial de usuario de BD |
+| BD gestionada por terceros | BD administrada por el equipo / DBA |
+
+---
+
+## 8.3 Lección: Migrations (goose)
+
+### ¿Qué es una migración?
+
+Una **migración** es un cambio versionado del **esquema** de la BD (crear tablas, columnas, índices). Se guarda como archivo SQL dentro del repo, junto al código que lo necesita.
+
+🧠 **Analogía:** son los planos de remodelación numerados de una casa. Cada plano dice qué cambia; goose lleva la cuenta de cuál fue el último aplicado.
+
+```
+sql/schema/
+├── 001_users.sql     ← versión 1
+└── 002_notes.sql     ← versión 2
+
+goose up:  BD en versión 0 ──► aplica 001 ──► aplica 002 ──► versión 2
+           BD en versión 2 ──► "no migrations to run. current version: 2"
+```
+
+goose guarda la versión aplicada en una tabla propia (`goose_db_version`). Por eso ejecutarlo varias veces es seguro: solo aplica lo pendiente.
+
+**Equivalencia Java:** goose ≈ **Flyway / Liquibase**.
+
+### Pasos
+
+```bash
+# 1. Instalar goose
+go install github.com/pressly/goose/v3/cmd/goose@latest
+goose -version                          # ≥ v3.18.0
+
+# 2-3. .env en la raíz del repo, y protegido por .gitignore
+cd ~/learn-cicd-starter
+nano .env                               # DATABASE_URL=libsql://notely-db-audaceci02.aws-us-east-1.turso.io
+grep -qxF '.env' .gitignore || echo '.env' >> .gitignore
+git check-ignore -v .env                # .gitignore:N:.env    .env
+
+# 4-5. Token de autenticación → agregarlo a la URL en el .env
+turso db tokens create notely-db
+nano .env                               # DATABASE_URL=libsql://...turso.io?authToken=<TOKEN>
+
+# 6. Ejecutar las migraciones
+./scripts/migrateup.sh                  # OK 001_users.sql / OK 002_notes.sql
+
+# 7. Verificar las tablas
+turso db shell notely-db
+```
+
+```sql
+PRAGMA table_info(users);
+PRAGMA table_info(notes);
+```
+
+### Formato de `DATABASE_URL`
+
+```
+libsql://notely-db-audaceci02.aws-us-east-1.turso.io?authToken=eyJhbGci...
+└scheme┘ └──────────────── host de la BD ──────────┘ └─── token JWT ───┘
+```
+
+⚠️ Sin `?authToken=...` → `error code 401: Unauthorized: empty JWT token`.
+
+### El script `scripts/migrateup.sh`
+
+```bash
+#!/bin/bash
+
+if [ -f .env ]; then
+    source .env
+fi
+
+cd sql/schema
+goose turso $DATABASE_URL up
+```
+
+| Línea | Qué hace |
+|---|---|
+| `if [ -f .env ]; then source .env` | Si existe `.env` (en la Mac), carga sus variables. En el runner no existe → usa la variable de entorno del job |
+| `cd sql/schema` | goose busca los `.sql` en el directorio actual |
+| `goose turso $DATABASE_URL up` | Driver `turso`, cadena de conexión, aplicar migraciones pendientes |
+
+### Variable en la terminal vs. archivo `.env`
+
+```
+DATABASE_URL=... (escrito en la terminal)   ✗  variable de shell; el script hace "source .env" y la pisa
+DATABASE_URL=... (dentro del archivo .env)  ✓  es lo que lee migrateup.sh
+```
+
+---
+
+## 8.4 Lección: Migrate Automatically
+
+### Estrategias de migración en CD
+
+| Estrategia | Descripción |
+|---|---|
+| Durante el despliegue | El pipeline migra en cada deploy (**la que usa el curso**) |
+| Manual | Un DBA o dev las ejecuta a mano |
+| Con *down migrations* | Además se pueden revertir cambios de esquema |
+
+### El riesgo: cambios no retrocompatibles
+
+Si una migración **elimina** una tabla que la versión en producción todavía usa, la app falla hasta que se despliegue el código nuevo → *downtime*.
+
+**Solución (expand / contract):** hacerlo en dos despliegues.
+
+```
+Deploy 1:  código que YA NO usa la tabla X   (la tabla sigue existiendo)
+Deploy 2:  migración que elimina la tabla X  (nadie la usa → sin downtime)
+```
+
+### 1. Secreto en GitHub
+
+**Settings → Secrets and variables → Actions → New repository secret**
+
+| Campo | Valor |
+|---|---|
+| Name | `DATABASE_URL` |
+| Secret | La URL completa del `.env`, **con** `?authToken=...` y **sin comillas** ni `DATABASE_URL=` |
+
+Y en el job `deploy`:
+
+```yaml
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+```
+
+🧠 El secreto es una bóveda de GitHub; `${{ secrets.DATABASE_URL }}` es la llave con la que el runner lo saca en ejecución. En los logs aparece como `***`.
+
+### 2. Orden de los steps
+
+```
+Check out code
+Set up Go
+► Install goose              ← NUEVO: justo después de Go (go install)
+Build the app
+Authenticate to Google Cloud
+Set up Cloud SDK
+Build and push Docker image
+► Run migrations             ← NUEVO: después del build, antes del deploy
+Deploy to Cloud Run
+```
+
+| Por qué **después** del build | Por qué **antes** del deploy |
+|---|---|
+| Si la imagen falla, no se toca la BD | El esquema nuevo ya existe cuando arranca el código nuevo |
+
+### `cd.yml` final
+
+```yaml
+name: cd
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+    permissions:
+      contents: "read"
+      id-token: "write"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.1"
+
+      - name: Install goose
+        run: go install github.com/pressly/goose/v3/cmd/goose@latest
+
+      - name: Build the app
+        run: ./scripts/buildprod.sh
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: "projects/728416536675/locations/global/workloadIdentityPools/github/providers/my-repo"
+          service_account: "cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com"
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Build and push Docker image
+        run: gcloud builds submit --tag us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest .
+
+      - name: Run migrations
+        run: ./scripts/migrateup.sh
+
+      - name: Deploy to Cloud Run
+        run: gcloud run deploy notely --image us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest --region us-central1 --allow-unauthenticated --project inner-cinema-511617-v1 --max-instances=4
+```
+
+💡 No hace falta tocar el `PATH`: `setup-go` agrega `~/go/bin`, donde `go install` deja `goose`.
+
+### 3. Revisar credenciales antes del commit
+
+```bash
+git diff HEAD                                         # solo debe verse ${{ secrets.DATABASE_URL }}
+git diff HEAD | grep -niE 'authToken|libsql://|eyJ'   # sin salida = sin credenciales
+git status                                            # .env NO debe aparecer
+```
+
+### Resultado en el runner
+
+```
+Run migrations
+goose: no migrations to run. current version: 2
+```
+
+Es lo esperado: la BD ya se había migrado desde la Mac en la lección anterior.
+
+---
+
+## 8.5 Lección: Using the DB
+
+### Pasos de la lección
+
+1. **Secret Manager** (habilitar la API) → crear el secreto `notely_db_password` con la URL completa de la BD.
+2. **Cloud Run** → `notely` → **Edit & Deploy New Revision** → **Container(s) → Variables & Secrets → Reference A Secret**:
+
+| Campo | Valor |
+|---|---|
+| Name | `DATABASE_URL` |
+| Secret | `notely_db_password` |
+| Version | `latest` |
+
+3. **Deploy** → falla con error de permisos (**esperado**).
+4. **IAM & Admin** → service account `Cloud Run Deployer` → agregar rol **Secret Manager Secret Accessor** (`roles/secretmanager.secretAccessor`).
+5. **Cloud Run** → `notely` → editar → pestaña **Security** → service account `Cloud Run Deployer`.
+6. **Deploy** de nuevo → ✅.
+
+### La analogía: la bóveda del banco
+
+| Pieza | En la analogía | Qué es realmente |
+|---|---|---|
+| **Secret Manager** | La bóveda | Servicio de GCP que guarda valores sensibles cifrados |
+| **`notely_db_password`** | La caja fuerte | El secreto con la `DATABASE_URL` |
+| **Versiones (1, 2…)** | El contenido de la caja en cada momento | Cada cambio crea una versión; `latest` apunta a la última |
+| **Service account** | El empleado que va a la bóveda | Identidad con la que corre el contenedor |
+| **Secret Accessor** | La credencial del empleado | Permiso IAM para leer el secreto |
+| **`authToken`** | La llave guardada en la caja | JWT con el que Turso deja entrar a la BD |
+
+### Flujo completo en ejecución
+
+```
+┌────────────────────────── GCP ──────────────────────────┐
+│  Cloud Run: notely (nueva revisión)                     │
+│   └─ corre como ➜ Cloud Run Deployer (service account)  │
+│        │ ① "Dame notely_db_password:latest"             │
+│        ▼                                                │
+│  IAM: ¿tiene Secret Manager Secret Accessor?  ✅        │
+│        ▼                                                │
+│  Secret Manager ──② devuelve la URL──► env DATABASE_URL │
+└────────────────────────────┬────────────────────────────┘
+                             │ ③ libsql://...?authToken=eyJ...
+                             ▼
+                     ┌───────────────┐
+                     │  Turso (BD)   │ ④ valida el JWT ✅
+                     └───────────────┘
+```
+
+### Los tres errores, en orden
+
+| # | Síntoma | Causa | Solución |
+|---|---|---|---|
+| 1 | `Permission denied on secret ... for Revision service account 728416536675-compute@developer.gserviceaccount.com` | La revisión corría con la cuenta **por defecto** de Compute, sin el rol | Rol Secret Accessor a `Cloud Run Deployer` (paso 4) + usar esa cuenta (paso 5) |
+| 2 | `POST /v1/users` → **500**; log: `error code 401: Unauthorized: empty JWT token` | El secreto tenía la URL **sin** `?authToken=...` | Nueva versión del secreto con la URL completa |
+| 3 | Seguía fallando tras corregir el secreto | Cloud Run lee el secreto **al arrancar la instancia**, no en cada request | Desplegar una revisión nueva (Editar e implementar → Implementar) |
+
+### Dos secretos, dos consumidores
+
+| Secreto | Dónde vive | Quién lo usa | Para qué |
+|---|---|---|---|
+| `DATABASE_URL` | GitHub Actions | Runner del CD | Ejecutar `goose` (migraciones) |
+| `notely_db_password` | GCP Secret Manager | Contenedor en Cloud Run | La app en ejecución |
+
+💡 `gcloud run deploy` en el CD solo cambia la imagen: la referencia al secreto y la service account configuradas en la consola **se conservan** en las revisiones siguientes.
+
+### Por qué se hace así
+
+- **Seguridad:** la credencial no queda en el repo, en el YAML ni en la imagen Docker.
+- **Mínimo privilegio:** solo la cuenta que lo necesita puede leer el secreto.
+- **Rotación fácil:** nueva versión del secreto + nueva revisión, sin tocar código.
+
+**Equivalencia La Tinka (EKS):** Secret Manager ≈ **AWS Secrets Manager / Kubernetes Secrets**; la service account con su rol ≈ **IRSA** (IAM Role for Service Accounts).
+
+---
+
+## 8.6 Probar el despliegue
+
+### Criterios de la lección
+
+| # | Acción | Resultado esperado |
+|---|---|---|
+| 1 | Crear un usuario | Se crea sin error |
+| 2 | Crear una nota | Aparece la nota |
+| 3 | Refrescar la página (`Cmd + R`) | Sigue con la sesión iniciada |
+| 4 | Revisar la lista | Se ven las notas creadas |
+
+### Desde la consola de GCP
+
+1. **Cloud Run** → `notely` → ícono **verde ✅** → clic en la URL: `https://notely-728416536675.us-central1.run.app`
+2. **Cloud Shell** (`>_`):
+
+```bash
+URL=https://notely-728416536675.us-central1.run.app
+curl -i $URL/v1/healthz
+curl -i -X POST $URL/v1/users \
+  -H "Content-Type: application/json" \
+  -d '{"name":"auda-test"}'               # 201 Created + api_key
+```
+
+3. **Logs:** Cloud Run → `notely` → **Observabilidad → Registros**.
+
+### Envío en Boot.dev (terminal de la Mac)
+
+```bash
+bootdev config base_url https://notely-728416536675.us-central1.run.app/
+bootdev run <ID-DE-LA-LECCION>
+bootdev run <ID-DE-LA-LECCION> -s
+```
+
+---
+
+## 8.7 Comandos nuevos de la Sección 8
+
+### Turso
+
+```bash
+brew tap libsql/sqld && brew trust libsql/sqld
+brew install tursodatabase/tap/turso
+turso auth login
+turso db create notely-db
+turso db list
+turso db show notely-db                 # URL y detalles
+turso db shell notely-db
+turso db tokens create notely-db
+turso db tokens invalidate notely-db    # invalida TODOS los tokens de la BD
+turso db destroy notely-db              # limpieza al final del curso
+```
+
+### goose
+
+```bash
+go install github.com/pressly/goose/v3/cmd/goose@latest
+goose -version
+goose turso "$DATABASE_URL" up          # aplicar pendientes
+goose turso "$DATABASE_URL" status      # ver versión aplicada
+goose turso "$DATABASE_URL" down        # revertir la última
+./scripts/migrateup.sh
+```
+
+### Seguridad / Git
+
+```bash
+git check-ignore -v .env
+git diff HEAD | grep -niE 'authToken|libsql://|eyJ'
+```
+
+### gcloud (equivalente CLI de la lección Using the DB)
+
+```bash
+gcloud services enable secretmanager.googleapis.com
+gcloud secrets create notely_db_password --data-file=-          # pegar URL + Ctrl+D
+gcloud secrets versions add notely_db_password --data-file=-    # nueva versión
+gcloud projects add-iam-policy-binding inner-cinema-511617-v1 \
+  --member="serviceAccount:cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+gcloud run services update notely --region us-central1 \
+  --service-account cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com \
+  --set-secrets DATABASE_URL=notely_db_password:latest
+```
+
+---
+
+## 8.8 Notas y errores encontrados
+
+| Situación | Causa | Solución |
+|---|---|---|
+| `No available formula with the name "libsql/sqld/sqld"` | La dependencia `sqld` vive en otro tap | `brew tap libsql/sqld` |
+| `Refusing to load formula ... from untrusted tap` | Homebrew exige confiar en taps de terceros | `brew trust libsql/sqld` |
+| `empty JWT token` al correr `migrateup.sh` | `DATABASE_URL` escrita en la terminal, no en `.env`; además typo `llibsql://` | Editar `.env`, una sola línea `libsql://...?authToken=...` |
+| Token pegado en el chat | Credencial expuesta | `turso db tokens invalidate notely-db` + generar otro; compartir salidas con `***` |
+| Commit de `cd.yml` hecho en la rama `docs` | Se trabajó sin cambiar de rama | Rama `migrations` desde `main` actualizado → PR #12 |
+| Deploy de Cloud Run: `Permission denied on secret` | Revisión con la cuenta por defecto de Compute | Secret Accessor + service account `Cloud Run Deployer` |
+| `POST /v1/users` → 500 / `401 empty JWT token` en logs | Secreto de GCP sin `?authToken=` | Nueva versión del secreto + nueva revisión |
+| Migración falla en el runner con URL inválida | Secreto de GitHub con comillas o con `DATABASE_URL=` | Pegar solo `libsql://...?authToken=...` |
+
+### Reglas de trabajo consolidadas
+
+1. **Las credenciales nunca entran al repo:** `.env` en `.gitignore` y `git diff HEAD` antes de cada commit.
+2. **Un secreto por consumidor:** GitHub Secrets para el pipeline, Secret Manager para la app en ejecución.
+3. **Migrar después del build y antes del deploy.**
+4. **Cambios destructivos de esquema en dos despliegues** (expand / contract).
+5. **Mínimo privilegio:** el rol Secret Accessor solo a la cuenta que lo necesita.
+6. **Tras rotar un secreto, desplegar una revisión nueva.**
+7. **Ante un 500, ir primero a los logs:** el error real está ahí.
+
+---
+
+## 8.9 Flujo completo ejecutado en la Sección 8
+
+```bash
+# 1. Lección Turso
+brew tap libsql/sqld && brew trust libsql/sqld
+brew install tursodatabase/tap/turso
+turso auth login
+turso db list                                       # notely-db
+turso db shell notely-db                            # SELECT sqlite_version(); ...
+
+# 2. Lección Migrations
+go install github.com/pressly/goose/v3/cmd/goose@latest
+cd ~/learn-cicd-starter
+turso db tokens create notely-db
+nano .env                                           # DATABASE_URL=libsql://...?authToken=...
+git check-ignore -v .env
+./scripts/migrateup.sh                              # OK 001, OK 002
+turso db shell notely-db                            # PRAGMA table_info(users); / (notes);
+
+# 3. Lección Migrate Automatically
+#    GitHub → Settings → Secrets and variables → Actions → DATABASE_URL
+git checkout main
+git pull origin main
+git checkout -b migrations
+nano .github/workflows/cd.yml                       # env + Install goose + Run migrations (sección 8.4)
+git diff HEAD | grep -niE 'authToken|libsql://|eyJ' # sin salida
+git add .github/workflows/cd.yml
+git commit -m "Run DB migrations in CD workflow"
+git push -u origin migrations
+# PR #12 (migrations → main) → Tests ✅ Style ✅ → merge
+# CD → Run migrations: "no migrations to run. current version: 2" → Deploy ✅
+
+# 4. Lección Using the DB (consola GCP)
+#    Secret Manager: notely_db_password (v1 sin token → v2 con ?authToken=)
+#    Cloud Run: DATABASE_URL ← notely_db_password:latest
+#    IAM: Cloud Run Deployer + Secret Manager Secret Accessor
+#    Cloud Run → Security → service account Cloud Run Deployer → Deploy
+#    Nueva revisión tras la versión 2 del secreto
+
+# 5. Pruebas
+#    Navegador: crear usuario, nota, refrescar, ver notas ✅
+bootdev config base_url https://notely-728416536675.us-central1.run.app/
+bootdev run <ID> -s
+
+# 6. Sincronizar
+git checkout main
+git pull origin main                                # 4fd4b38 Merge PR #12
+```
+
+Commits de la rama `migrations`:
+
+```
+e89a62e Run DB migrations in CD workflow
+```
+
+---
+
+## 8.10 Referencias oficiales de la Sección 8
+
+**Turso / libsql**
+- Quickstart: https://docs.turso.tech/quickstart
+- Instalación del CLI: https://docs.turso.tech/cli/installation
+- `turso db tokens create`: https://docs.turso.tech/cli/db/tokens/create
+- `turso db tokens invalidate`: https://docs.turso.tech/cli/db/tokens/invalidate
+- `turso db destroy`: https://docs.turso.tech/cli/db/destroy
+- libsql: https://github.com/tursodatabase/libsql
+- SQLite `PRAGMA table_info`: https://www.sqlite.org/pragma.html#pragma_table_info
+
+**goose**
+- Repositorio: https://github.com/pressly/goose
+- Instalación: https://pressly.github.io/goose/installation/
+
+**GitHub Actions**
+- Secretos en GitHub Actions: https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions
+- `jobs.<job_id>.env`: https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idenv
+- About forks: https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/about-forks
+
+**Google Cloud**
+- Secret Manager (visión general): https://cloud.google.com/secret-manager/docs/overview
+- Agregar una versión de secreto: https://cloud.google.com/secret-manager/docs/add-secret-version
+- Roles de Secret Manager: https://cloud.google.com/secret-manager/docs/access-control
+- Cloud Run — configurar secretos: https://cloud.google.com/run/docs/configuring/services/secrets
+- Cloud Run — identidad del servicio: https://cloud.google.com/run/docs/securing/service-identity
+- Cloud Run — logs: https://cloud.google.com/run/docs/logging
+- Cloud Shell: https://cloud.google.com/shell/docs/how-cloud-shell-works
+
+**Homebrew**
+- Taps: https://docs.brew.sh/Taps
+
+---
+
+# CIERRE DEL CURSO — CI/CD Review
+
+## Logros
+
+```
+PR hacia main ──► CI (ci.yml)
+                   ├─ Tests: go test -cover · gosec
+                   └─ Style: go fmt · staticcheck
+                          │ ✅
+                          ▼
+                  merge a main ──► CD (cd.yml)
+                                    ├─ buildprod.sh (binario linux/amd64)
+                                    ├─ auth WIF (sin llaves)
+                                    ├─ gcloud builds submit ──► Artifact Registry
+                                    ├─ goose up ──────────────► Turso
+                                    └─ gcloud run deploy ─────► Cloud Run 🌐
+                                                                   │
+                                              Secret Manager ──────┘ (DATABASE_URL)
+```
+
+| Área | Lo construido |
+|---|---|
+| **CI** | PRs a `main` bloqueados si fallan: pruebas unitarias, formato, linting, seguridad |
+| **Base de datos** | SQLite en la nube (Turso) con migraciones versionadas (goose) |
+| **CD** | En cada merge: binario → imagen Docker → Artifact Registry → migraciones → nueva revisión en Cloud Run |
+
+## Cosas a tener en cuenta
+
+- **GCP es uno de los 3 grandes** proveedores (con AWS y Azure). Los servicios se parecen, pero a veces las diferencias importan.
+- **Cloud Run abstrae mucho:** DNS, SSL, balanceo de carga y autoescalado. Muchas empresas los gestionan a mano; siguen siendo habilidades valiosas.
+- **Turso es un host gestionado de terceros;** hay muchas otras opciones de BD y hosting.
+- **Casi todo tiene alternativas.** No hace falta dominarlas todas, pero sí entender algunas.
+
+### Mapa de equivalencias GCP ↔ AWS (stack de La Tinka)
+
+| Curso (GCP) | AWS / La Tinka |
+|---|---|
+| GitHub Actions | GitHub Actions / Jenkins / CodePipeline |
+| Artifact Registry | ECR |
+| Cloud Build | CodeBuild |
+| Cloud Run | EKS / ECS Fargate / App Runner |
+| WIF + Service Account | OIDC Provider + IAM Role (IRSA en EKS) |
+| Secret Manager | AWS Secrets Manager / Kubernetes Secrets |
+| Turso + goose | Oracle 19c + Flyway / Liquibase |
+| gosec / staticcheck | SonarQube / SpotBugs |
+
+## Limpieza (al terminar)
+
+⚠️ **Orden importante:** hacer el merge final de `docs` → `main` **antes** de borrar recursos, porque ese merge dispara el CD.
+
+```bash
+# 1. Merge final de la documentación (dispara el CD una última vez)
+cd ~/learn-cicd-starter
+git checkout docs
+git merge main                       # traer los cambios de main a docs
+# → PR docs → main → merge → esperar CD ✅
+
+# 2. Borrar la BD de Turso
+turso db destroy notely-db
+
+# 3. Cerrar el proyecto de GCP (borra Cloud Run, Artifact Registry, Secret Manager, WIF…)
+#    https://console.cloud.google.com/iam-admin/settings → Shut down
+gcloud projects delete inner-cinema-511617-v1   # alternativa por CLI
+
+# 4. Opcional: borrar el secreto DATABASE_URL del repo
+#    GitHub → Settings → Secrets and variables → Actions
+```
+
+---
+
 # ESTADO DEL CURSO
 
 | Sección | Estado |
@@ -2686,14 +4343,15 @@ Commits de la rama `security`:
 | 3 — Formatting | ✅ Completada |
 | 4 — Linting | ✅ Completada |
 | 5 — Security | ✅ Completada |
-| 6 — Por confirmar al iniciar | ⏳ Pendiente |
+| 6 — Continuous Deployment (Build) | ✅ Completada |
+| 7 — Continuous Deployment (Deploy) | ✅ Completada |
+| 8 — Database | ✅ Completada |
+| Cierre — CI/CD Review | ✅ **Curso terminado** (27/11/2026) |
 
-Tema pendiente según el temario inicial: Continuous Deployment.
-
-### Pipeline actual
+### Pipeline final
 
 ```
-PR hacia main
+PR hacia main (ci.yml)
       │
       ├──► Job "Tests"                    ├──► Job "Style"
       │     ├─ checkout                   │     ├─ checkout
@@ -2701,6 +4359,20 @@ PR hacia main
       │     ├─ go test -cover ./...       │     ├─ test -z $(go fmt ./...)
       │     ├─ go install gosec           │     ├─ go install staticcheck
       │     └─ gosec ./...                │     └─ staticcheck ./...
+
+Push a main (cd.yml)   env: DATABASE_URL ← secrets.DATABASE_URL
+      │
+      └──► Job "Deploy"
+            ├─ checkout
+            ├─ setup-go
+            ├─ go install goose
+            ├─ ./scripts/buildprod.sh
+            ├─ google-github-actions/auth  (WIF)
+            ├─ google-github-actions/setup-gcloud
+            ├─ gcloud builds submit ──► Artifact Registry (notely:latest)
+            ├─ ./scripts/migrateup.sh ──► Turso (notely-db)
+            └─ gcloud run deploy    ──► Cloud Run (notely, us-central1) 🌐
+                                          └─ DATABASE_URL ← Secret Manager (notely_db_password)
 ```
 
 ### Ramas y PRs
@@ -2711,13 +4383,32 @@ PR hacia main
 | `formatting` | #2 | ✅ Mergeada a `main` — ciclo cerrado |
 | `linting` | #3, #4 | ✅ Mergeada a `main` — ciclo cerrado |
 | `security` | #5 | ✅ Mergeada a `main` (`11e3175`) — ciclo cerrado |
+| `build` | #6 | ❌ Cerrado sin merge (reemplazado por #7) |
+| `build` | #7 | ✅ Mergeada a `main` (`a2d18d0`) — ciclo cerrado |
+| `auto-build` | #8 | ✅ Mergeada a `main` (`d1889af`) — ciclo cerrado |
+| `deploy` | #11 | ✅ Mergeada a `main` (`e440363`) — ciclo cerrado |
+| `migrations` | #12 | ✅ Mergeada a `main` (`4fd4b38`) — ciclo cerrado |
+| `docs` | — | ⏳ Pendiente: merge final a `main` |
 | — | bootdotdev#2988 | ❌ Creado por error contra el repo original — cerrado |
 
-**Próximo paso:** al iniciar la Sección 6, crear una rama nueva desde `main` actualizado:
+### Recursos a eliminar (limpieza)
 
-```bash
-cd ~/learn-cicd-starter
-git checkout main
-git pull origin main
-git checkout -b <nombre-rama-seccion-6>
-```
+| Recurso | Valor | Cómo eliminar |
+|---|---|---|
+| Proyecto GCP | `notely` (`inner-cinema-511617-v1`) | Shut down del proyecto (borra todo lo de abajo) |
+| ↳ Artifact Registry | `notely-ar-repo` (us-central1) | (incluido) |
+| ↳ Cloud Run | Servicio `notely` | (incluido) |
+| ↳ Secret Manager | `notely_db_password` | (incluido) |
+| ↳ Service account | `cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com` | (incluido) |
+| ↳ WIF | Pool `github` / Provider `my-repo` | (incluido) |
+| Facturación | `notely-billing` | Revisar que no queden cargos; cerrar la cuenta si no se usará |
+| Turso | `notely-db` | `turso db destroy notely-db` |
+| GitHub | Secreto `DATABASE_URL` | Settings → Secrets and variables → Actions |
+
+### Pendientes finales
+
+1. [ ] Commit de esta consolidación en la rama `docs`
+2. [ ] Merge final `docs` → `main` (dispara el CD: hacerlo **antes** de la limpieza)
+3. [ ] `turso db destroy notely-db`
+4. [ ] Cerrar el proyecto `notely` en GCP
+5. [ ] Borrar el secreto `DATABASE_URL` del repo
