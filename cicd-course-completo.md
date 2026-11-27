@@ -2,7 +2,8 @@
 
 **Estudiante:** Auda (Cecibel Espinoza)
 **Repositorio:** https://github.com/cecibelauda/learn-cicd-starter
-**Ramas:** `addtests` (PR #1), `formatting` (PR #2), `linting` (PR #3/#4), `security` (PR #5), `build` (PR #7), `auto-build` (PR #8), `deploy` (PR #11) — todas mergeadas a `main`
+**Ramas:** `addtests` (PR #1), `formatting` (PR #2), `linting` (PR #3/#4), `security` (PR #5), `build` (PR #7), `auto-build` (PR #8), `deploy` (PR #11), `migrations` (PR #12) — todas mergeadas a `main`
+**Estado:** ✅ Curso completado (27/11/2026)
 **Directorio local:** `~/learn-cicd-starter`
 
 ---
@@ -3669,6 +3670,670 @@ b5b190e cd: deploy to Cloud Run and update welcome heading
 
 ---
 
+---
+
+# SECCIÓN 8 — Database
+
+## 8.1 Objetivo de la sección
+
+Hasta la Sección 7, Notely estaba publicada en Cloud Run, pero **sin base de datos**: la página cargaba, pero no se podían crear usuarios ni notas. En la Sección 8 se conecta la app a una BD en la nube y se integran las **migraciones** al pipeline de CD.
+
+```
+Sección 7:  Cloud Run 🌐  (sin BD → solo HTML estático)
+Sección 8:  Cloud Run 🌐 ──DATABASE_URL (Secret Manager)──► Turso (libsql)
+                 ▲
+CD:  build ──► Artifact Registry ──► goose (migraciones) ──► gcloud run deploy
+```
+
+| Lección | Qué se hizo |
+|---|---|
+| Turso | Crear la BD `notely-db` e instalar el CLI |
+| Migrations | Crear el esquema (`users`, `notes`) con goose desde la Mac |
+| Migrate Automatically | Ejecutar las migraciones en el CD (secreto de GitHub + goose en el runner) |
+| Using the DB | Pasar `DATABASE_URL` a Cloud Run desde Secret Manager |
+
+---
+
+## 8.2 Lección: Turso
+
+### ¿Qué es Turso?
+
+[Turso](https://turso.tech/) es un proveedor cloud de bases de datos *serverless* tipo [SQLite](https://www.sqlite.org/). Técnicamente usa su propio **fork** de SQLite, llamado [libsql](https://github.com/tursodatabase/libsql). Tiene un plan gratuito generoso.
+
+### ¿Qué es un fork?
+
+Un **fork** es una copia independiente de un proyecto que sigue su propio camino.
+
+🧠 **Analogía:** copias la receta de ají de gallina de tu mamá y le haces tus cambios. La original sigue igual; la tuya ya es otra versión.
+
+```
+SQLite (original)
+  ├── v3.40 ── v3.41 ── v3.42 ── ...        ← SQLite sigue su camino
+  └──► FORK: libsql (Turso)
+         └── + acceso por red / serverless
+             + replicación                   ← libsql sigue el suyo
+```
+
+| | Fork | Clone |
+|---|---|---|
+| Dónde queda la copia | En tu cuenta de GitHub (remoto) | En tu Mac (local) |
+| Para qué sirve | Tener tu propia versión del proyecto | Trabajar el código en tu máquina |
+
+### Instalación del CLI (Mac)
+
+```bash
+brew install tursodatabase/tap/turso
+```
+
+Con las versiones nuevas de Homebrew, la dependencia `sqld` vive en otro *tap* que hay que agregar y marcar como confiable:
+
+```bash
+brew tap libsql/sqld
+brew trust libsql/sqld                 # o: brew trust --formula libsql/sqld/sqld
+brew install tursodatabase/tap/turso
+turso --version
+which turso                            # /opt/homebrew/bin/turso
+```
+
+### Comandos de la lección
+
+```bash
+turso auth login                       # abre el navegador
+turso db create notely-db              # si no se creó en el onboarding
+turso db list
+turso db shell notely-db
+```
+
+```sql
+SELECT sqlite_version();
+CREATE TABLE test (id INT, name TEXT);
+SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;
+DROP TABLE test;
+-- salir con Ctrl+C
+```
+
+El shell SQL sirve para **depurar a mano**; el servidor se conecta desde el código.
+
+### Equivalencia con el stack de La Tinka
+
+| Turso | Oracle 19c on-premise |
+|---|---|
+| `turso db shell notely-db` | SQL*Plus / SQL Developer |
+| `libsql://...?authToken=...` | JDBC URL + usuario/contraseña |
+| `turso db tokens create` | Credencial de usuario de BD |
+| BD gestionada por terceros | BD administrada por el equipo / DBA |
+
+---
+
+## 8.3 Lección: Migrations (goose)
+
+### ¿Qué es una migración?
+
+Una **migración** es un cambio versionado del **esquema** de la BD (crear tablas, columnas, índices). Se guarda como archivo SQL dentro del repo, junto al código que lo necesita.
+
+🧠 **Analogía:** son los planos de remodelación numerados de una casa. Cada plano dice qué cambia; goose lleva la cuenta de cuál fue el último aplicado.
+
+```
+sql/schema/
+├── 001_users.sql     ← versión 1
+└── 002_notes.sql     ← versión 2
+
+goose up:  BD en versión 0 ──► aplica 001 ──► aplica 002 ──► versión 2
+           BD en versión 2 ──► "no migrations to run. current version: 2"
+```
+
+goose guarda la versión aplicada en una tabla propia (`goose_db_version`). Por eso ejecutarlo varias veces es seguro: solo aplica lo pendiente.
+
+**Equivalencia Java:** goose ≈ **Flyway / Liquibase**.
+
+### Pasos
+
+```bash
+# 1. Instalar goose
+go install github.com/pressly/goose/v3/cmd/goose@latest
+goose -version                          # ≥ v3.18.0
+
+# 2-3. .env en la raíz del repo, y protegido por .gitignore
+cd ~/learn-cicd-starter
+nano .env                               # DATABASE_URL=libsql://notely-db-audaceci02.aws-us-east-1.turso.io
+grep -qxF '.env' .gitignore || echo '.env' >> .gitignore
+git check-ignore -v .env                # .gitignore:N:.env    .env
+
+# 4-5. Token de autenticación → agregarlo a la URL en el .env
+turso db tokens create notely-db
+nano .env                               # DATABASE_URL=libsql://...turso.io?authToken=<TOKEN>
+
+# 6. Ejecutar las migraciones
+./scripts/migrateup.sh                  # OK 001_users.sql / OK 002_notes.sql
+
+# 7. Verificar las tablas
+turso db shell notely-db
+```
+
+```sql
+PRAGMA table_info(users);
+PRAGMA table_info(notes);
+```
+
+### Formato de `DATABASE_URL`
+
+```
+libsql://notely-db-audaceci02.aws-us-east-1.turso.io?authToken=eyJhbGci...
+└scheme┘ └──────────────── host de la BD ──────────┘ └─── token JWT ───┘
+```
+
+⚠️ Sin `?authToken=...` → `error code 401: Unauthorized: empty JWT token`.
+
+### El script `scripts/migrateup.sh`
+
+```bash
+#!/bin/bash
+
+if [ -f .env ]; then
+    source .env
+fi
+
+cd sql/schema
+goose turso $DATABASE_URL up
+```
+
+| Línea | Qué hace |
+|---|---|
+| `if [ -f .env ]; then source .env` | Si existe `.env` (en la Mac), carga sus variables. En el runner no existe → usa la variable de entorno del job |
+| `cd sql/schema` | goose busca los `.sql` en el directorio actual |
+| `goose turso $DATABASE_URL up` | Driver `turso`, cadena de conexión, aplicar migraciones pendientes |
+
+### Variable en la terminal vs. archivo `.env`
+
+```
+DATABASE_URL=... (escrito en la terminal)   ✗  variable de shell; el script hace "source .env" y la pisa
+DATABASE_URL=... (dentro del archivo .env)  ✓  es lo que lee migrateup.sh
+```
+
+---
+
+## 8.4 Lección: Migrate Automatically
+
+### Estrategias de migración en CD
+
+| Estrategia | Descripción |
+|---|---|
+| Durante el despliegue | El pipeline migra en cada deploy (**la que usa el curso**) |
+| Manual | Un DBA o dev las ejecuta a mano |
+| Con *down migrations* | Además se pueden revertir cambios de esquema |
+
+### El riesgo: cambios no retrocompatibles
+
+Si una migración **elimina** una tabla que la versión en producción todavía usa, la app falla hasta que se despliegue el código nuevo → *downtime*.
+
+**Solución (expand / contract):** hacerlo en dos despliegues.
+
+```
+Deploy 1:  código que YA NO usa la tabla X   (la tabla sigue existiendo)
+Deploy 2:  migración que elimina la tabla X  (nadie la usa → sin downtime)
+```
+
+### 1. Secreto en GitHub
+
+**Settings → Secrets and variables → Actions → New repository secret**
+
+| Campo | Valor |
+|---|---|
+| Name | `DATABASE_URL` |
+| Secret | La URL completa del `.env`, **con** `?authToken=...` y **sin comillas** ni `DATABASE_URL=` |
+
+Y en el job `deploy`:
+
+```yaml
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+```
+
+🧠 El secreto es una bóveda de GitHub; `${{ secrets.DATABASE_URL }}` es la llave con la que el runner lo saca en ejecución. En los logs aparece como `***`.
+
+### 2. Orden de los steps
+
+```
+Check out code
+Set up Go
+► Install goose              ← NUEVO: justo después de Go (go install)
+Build the app
+Authenticate to Google Cloud
+Set up Cloud SDK
+Build and push Docker image
+► Run migrations             ← NUEVO: después del build, antes del deploy
+Deploy to Cloud Run
+```
+
+| Por qué **después** del build | Por qué **antes** del deploy |
+|---|---|
+| Si la imagen falla, no se toca la BD | El esquema nuevo ya existe cuando arranca el código nuevo |
+
+### `cd.yml` final
+
+```yaml
+name: cd
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+    permissions:
+      contents: "read"
+      id-token: "write"
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.1"
+
+      - name: Install goose
+        run: go install github.com/pressly/goose/v3/cmd/goose@latest
+
+      - name: Build the app
+        run: ./scripts/buildprod.sh
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: "projects/728416536675/locations/global/workloadIdentityPools/github/providers/my-repo"
+          service_account: "cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com"
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Build and push Docker image
+        run: gcloud builds submit --tag us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest .
+
+      - name: Run migrations
+        run: ./scripts/migrateup.sh
+
+      - name: Deploy to Cloud Run
+        run: gcloud run deploy notely --image us-central1-docker.pkg.dev/inner-cinema-511617-v1/notely-ar-repo/notely:latest --region us-central1 --allow-unauthenticated --project inner-cinema-511617-v1 --max-instances=4
+```
+
+💡 No hace falta tocar el `PATH`: `setup-go` agrega `~/go/bin`, donde `go install` deja `goose`.
+
+### 3. Revisar credenciales antes del commit
+
+```bash
+git diff HEAD                                         # solo debe verse ${{ secrets.DATABASE_URL }}
+git diff HEAD | grep -niE 'authToken|libsql://|eyJ'   # sin salida = sin credenciales
+git status                                            # .env NO debe aparecer
+```
+
+### Resultado en el runner
+
+```
+Run migrations
+goose: no migrations to run. current version: 2
+```
+
+Es lo esperado: la BD ya se había migrado desde la Mac en la lección anterior.
+
+---
+
+## 8.5 Lección: Using the DB
+
+### Pasos de la lección
+
+1. **Secret Manager** (habilitar la API) → crear el secreto `notely_db_password` con la URL completa de la BD.
+2. **Cloud Run** → `notely` → **Edit & Deploy New Revision** → **Container(s) → Variables & Secrets → Reference A Secret**:
+
+| Campo | Valor |
+|---|---|
+| Name | `DATABASE_URL` |
+| Secret | `notely_db_password` |
+| Version | `latest` |
+
+3. **Deploy** → falla con error de permisos (**esperado**).
+4. **IAM & Admin** → service account `Cloud Run Deployer` → agregar rol **Secret Manager Secret Accessor** (`roles/secretmanager.secretAccessor`).
+5. **Cloud Run** → `notely` → editar → pestaña **Security** → service account `Cloud Run Deployer`.
+6. **Deploy** de nuevo → ✅.
+
+### La analogía: la bóveda del banco
+
+| Pieza | En la analogía | Qué es realmente |
+|---|---|---|
+| **Secret Manager** | La bóveda | Servicio de GCP que guarda valores sensibles cifrados |
+| **`notely_db_password`** | La caja fuerte | El secreto con la `DATABASE_URL` |
+| **Versiones (1, 2…)** | El contenido de la caja en cada momento | Cada cambio crea una versión; `latest` apunta a la última |
+| **Service account** | El empleado que va a la bóveda | Identidad con la que corre el contenedor |
+| **Secret Accessor** | La credencial del empleado | Permiso IAM para leer el secreto |
+| **`authToken`** | La llave guardada en la caja | JWT con el que Turso deja entrar a la BD |
+
+### Flujo completo en ejecución
+
+```
+┌────────────────────────── GCP ──────────────────────────┐
+│  Cloud Run: notely (nueva revisión)                     │
+│   └─ corre como ➜ Cloud Run Deployer (service account)  │
+│        │ ① "Dame notely_db_password:latest"             │
+│        ▼                                                │
+│  IAM: ¿tiene Secret Manager Secret Accessor?  ✅        │
+│        ▼                                                │
+│  Secret Manager ──② devuelve la URL──► env DATABASE_URL │
+└────────────────────────────┬────────────────────────────┘
+                             │ ③ libsql://...?authToken=eyJ...
+                             ▼
+                     ┌───────────────┐
+                     │  Turso (BD)   │ ④ valida el JWT ✅
+                     └───────────────┘
+```
+
+### Los tres errores, en orden
+
+| # | Síntoma | Causa | Solución |
+|---|---|---|---|
+| 1 | `Permission denied on secret ... for Revision service account 728416536675-compute@developer.gserviceaccount.com` | La revisión corría con la cuenta **por defecto** de Compute, sin el rol | Rol Secret Accessor a `Cloud Run Deployer` (paso 4) + usar esa cuenta (paso 5) |
+| 2 | `POST /v1/users` → **500**; log: `error code 401: Unauthorized: empty JWT token` | El secreto tenía la URL **sin** `?authToken=...` | Nueva versión del secreto con la URL completa |
+| 3 | Seguía fallando tras corregir el secreto | Cloud Run lee el secreto **al arrancar la instancia**, no en cada request | Desplegar una revisión nueva (Editar e implementar → Implementar) |
+
+### Dos secretos, dos consumidores
+
+| Secreto | Dónde vive | Quién lo usa | Para qué |
+|---|---|---|---|
+| `DATABASE_URL` | GitHub Actions | Runner del CD | Ejecutar `goose` (migraciones) |
+| `notely_db_password` | GCP Secret Manager | Contenedor en Cloud Run | La app en ejecución |
+
+💡 `gcloud run deploy` en el CD solo cambia la imagen: la referencia al secreto y la service account configuradas en la consola **se conservan** en las revisiones siguientes.
+
+### Por qué se hace así
+
+- **Seguridad:** la credencial no queda en el repo, en el YAML ni en la imagen Docker.
+- **Mínimo privilegio:** solo la cuenta que lo necesita puede leer el secreto.
+- **Rotación fácil:** nueva versión del secreto + nueva revisión, sin tocar código.
+
+**Equivalencia La Tinka (EKS):** Secret Manager ≈ **AWS Secrets Manager / Kubernetes Secrets**; la service account con su rol ≈ **IRSA** (IAM Role for Service Accounts).
+
+---
+
+## 8.6 Probar el despliegue
+
+### Criterios de la lección
+
+| # | Acción | Resultado esperado |
+|---|---|---|
+| 1 | Crear un usuario | Se crea sin error |
+| 2 | Crear una nota | Aparece la nota |
+| 3 | Refrescar la página (`Cmd + R`) | Sigue con la sesión iniciada |
+| 4 | Revisar la lista | Se ven las notas creadas |
+
+### Desde la consola de GCP
+
+1. **Cloud Run** → `notely` → ícono **verde ✅** → clic en la URL: `https://notely-728416536675.us-central1.run.app`
+2. **Cloud Shell** (`>_`):
+
+```bash
+URL=https://notely-728416536675.us-central1.run.app
+curl -i $URL/v1/healthz
+curl -i -X POST $URL/v1/users \
+  -H "Content-Type: application/json" \
+  -d '{"name":"auda-test"}'               # 201 Created + api_key
+```
+
+3. **Logs:** Cloud Run → `notely` → **Observabilidad → Registros**.
+
+### Envío en Boot.dev (terminal de la Mac)
+
+```bash
+bootdev config base_url https://notely-728416536675.us-central1.run.app/
+bootdev run <ID-DE-LA-LECCION>
+bootdev run <ID-DE-LA-LECCION> -s
+```
+
+---
+
+## 8.7 Comandos nuevos de la Sección 8
+
+### Turso
+
+```bash
+brew tap libsql/sqld && brew trust libsql/sqld
+brew install tursodatabase/tap/turso
+turso auth login
+turso db create notely-db
+turso db list
+turso db show notely-db                 # URL y detalles
+turso db shell notely-db
+turso db tokens create notely-db
+turso db tokens invalidate notely-db    # invalida TODOS los tokens de la BD
+turso db destroy notely-db              # limpieza al final del curso
+```
+
+### goose
+
+```bash
+go install github.com/pressly/goose/v3/cmd/goose@latest
+goose -version
+goose turso "$DATABASE_URL" up          # aplicar pendientes
+goose turso "$DATABASE_URL" status      # ver versión aplicada
+goose turso "$DATABASE_URL" down        # revertir la última
+./scripts/migrateup.sh
+```
+
+### Seguridad / Git
+
+```bash
+git check-ignore -v .env
+git diff HEAD | grep -niE 'authToken|libsql://|eyJ'
+```
+
+### gcloud (equivalente CLI de la lección Using the DB)
+
+```bash
+gcloud services enable secretmanager.googleapis.com
+gcloud secrets create notely_db_password --data-file=-          # pegar URL + Ctrl+D
+gcloud secrets versions add notely_db_password --data-file=-    # nueva versión
+gcloud projects add-iam-policy-binding inner-cinema-511617-v1 \
+  --member="serviceAccount:cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+gcloud run services update notely --region us-central1 \
+  --service-account cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com \
+  --set-secrets DATABASE_URL=notely_db_password:latest
+```
+
+---
+
+## 8.8 Notas y errores encontrados
+
+| Situación | Causa | Solución |
+|---|---|---|
+| `No available formula with the name "libsql/sqld/sqld"` | La dependencia `sqld` vive en otro tap | `brew tap libsql/sqld` |
+| `Refusing to load formula ... from untrusted tap` | Homebrew exige confiar en taps de terceros | `brew trust libsql/sqld` |
+| `empty JWT token` al correr `migrateup.sh` | `DATABASE_URL` escrita en la terminal, no en `.env`; además typo `llibsql://` | Editar `.env`, una sola línea `libsql://...?authToken=...` |
+| Token pegado en el chat | Credencial expuesta | `turso db tokens invalidate notely-db` + generar otro; compartir salidas con `***` |
+| Commit de `cd.yml` hecho en la rama `docs` | Se trabajó sin cambiar de rama | Rama `migrations` desde `main` actualizado → PR #12 |
+| Deploy de Cloud Run: `Permission denied on secret` | Revisión con la cuenta por defecto de Compute | Secret Accessor + service account `Cloud Run Deployer` |
+| `POST /v1/users` → 500 / `401 empty JWT token` en logs | Secreto de GCP sin `?authToken=` | Nueva versión del secreto + nueva revisión |
+| Migración falla en el runner con URL inválida | Secreto de GitHub con comillas o con `DATABASE_URL=` | Pegar solo `libsql://...?authToken=...` |
+
+### Reglas de trabajo consolidadas
+
+1. **Las credenciales nunca entran al repo:** `.env` en `.gitignore` y `git diff HEAD` antes de cada commit.
+2. **Un secreto por consumidor:** GitHub Secrets para el pipeline, Secret Manager para la app en ejecución.
+3. **Migrar después del build y antes del deploy.**
+4. **Cambios destructivos de esquema en dos despliegues** (expand / contract).
+5. **Mínimo privilegio:** el rol Secret Accessor solo a la cuenta que lo necesita.
+6. **Tras rotar un secreto, desplegar una revisión nueva.**
+7. **Ante un 500, ir primero a los logs:** el error real está ahí.
+
+---
+
+## 8.9 Flujo completo ejecutado en la Sección 8
+
+```bash
+# 1. Lección Turso
+brew tap libsql/sqld && brew trust libsql/sqld
+brew install tursodatabase/tap/turso
+turso auth login
+turso db list                                       # notely-db
+turso db shell notely-db                            # SELECT sqlite_version(); ...
+
+# 2. Lección Migrations
+go install github.com/pressly/goose/v3/cmd/goose@latest
+cd ~/learn-cicd-starter
+turso db tokens create notely-db
+nano .env                                           # DATABASE_URL=libsql://...?authToken=...
+git check-ignore -v .env
+./scripts/migrateup.sh                              # OK 001, OK 002
+turso db shell notely-db                            # PRAGMA table_info(users); / (notes);
+
+# 3. Lección Migrate Automatically
+#    GitHub → Settings → Secrets and variables → Actions → DATABASE_URL
+git checkout main
+git pull origin main
+git checkout -b migrations
+nano .github/workflows/cd.yml                       # env + Install goose + Run migrations (sección 8.4)
+git diff HEAD | grep -niE 'authToken|libsql://|eyJ' # sin salida
+git add .github/workflows/cd.yml
+git commit -m "Run DB migrations in CD workflow"
+git push -u origin migrations
+# PR #12 (migrations → main) → Tests ✅ Style ✅ → merge
+# CD → Run migrations: "no migrations to run. current version: 2" → Deploy ✅
+
+# 4. Lección Using the DB (consola GCP)
+#    Secret Manager: notely_db_password (v1 sin token → v2 con ?authToken=)
+#    Cloud Run: DATABASE_URL ← notely_db_password:latest
+#    IAM: Cloud Run Deployer + Secret Manager Secret Accessor
+#    Cloud Run → Security → service account Cloud Run Deployer → Deploy
+#    Nueva revisión tras la versión 2 del secreto
+
+# 5. Pruebas
+#    Navegador: crear usuario, nota, refrescar, ver notas ✅
+bootdev config base_url https://notely-728416536675.us-central1.run.app/
+bootdev run <ID> -s
+
+# 6. Sincronizar
+git checkout main
+git pull origin main                                # 4fd4b38 Merge PR #12
+```
+
+Commits de la rama `migrations`:
+
+```
+e89a62e Run DB migrations in CD workflow
+```
+
+---
+
+## 8.10 Referencias oficiales de la Sección 8
+
+**Turso / libsql**
+- Quickstart: https://docs.turso.tech/quickstart
+- Instalación del CLI: https://docs.turso.tech/cli/installation
+- `turso db tokens create`: https://docs.turso.tech/cli/db/tokens/create
+- `turso db tokens invalidate`: https://docs.turso.tech/cli/db/tokens/invalidate
+- `turso db destroy`: https://docs.turso.tech/cli/db/destroy
+- libsql: https://github.com/tursodatabase/libsql
+- SQLite `PRAGMA table_info`: https://www.sqlite.org/pragma.html#pragma_table_info
+
+**goose**
+- Repositorio: https://github.com/pressly/goose
+- Instalación: https://pressly.github.io/goose/installation/
+
+**GitHub Actions**
+- Secretos en GitHub Actions: https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions
+- `jobs.<job_id>.env`: https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idenv
+- About forks: https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/about-forks
+
+**Google Cloud**
+- Secret Manager (visión general): https://cloud.google.com/secret-manager/docs/overview
+- Agregar una versión de secreto: https://cloud.google.com/secret-manager/docs/add-secret-version
+- Roles de Secret Manager: https://cloud.google.com/secret-manager/docs/access-control
+- Cloud Run — configurar secretos: https://cloud.google.com/run/docs/configuring/services/secrets
+- Cloud Run — identidad del servicio: https://cloud.google.com/run/docs/securing/service-identity
+- Cloud Run — logs: https://cloud.google.com/run/docs/logging
+- Cloud Shell: https://cloud.google.com/shell/docs/how-cloud-shell-works
+
+**Homebrew**
+- Taps: https://docs.brew.sh/Taps
+
+---
+
+# CIERRE DEL CURSO — CI/CD Review
+
+## Logros
+
+```
+PR hacia main ──► CI (ci.yml)
+                   ├─ Tests: go test -cover · gosec
+                   └─ Style: go fmt · staticcheck
+                          │ ✅
+                          ▼
+                  merge a main ──► CD (cd.yml)
+                                    ├─ buildprod.sh (binario linux/amd64)
+                                    ├─ auth WIF (sin llaves)
+                                    ├─ gcloud builds submit ──► Artifact Registry
+                                    ├─ goose up ──────────────► Turso
+                                    └─ gcloud run deploy ─────► Cloud Run 🌐
+                                                                   │
+                                              Secret Manager ──────┘ (DATABASE_URL)
+```
+
+| Área | Lo construido |
+|---|---|
+| **CI** | PRs a `main` bloqueados si fallan: pruebas unitarias, formato, linting, seguridad |
+| **Base de datos** | SQLite en la nube (Turso) con migraciones versionadas (goose) |
+| **CD** | En cada merge: binario → imagen Docker → Artifact Registry → migraciones → nueva revisión en Cloud Run |
+
+## Cosas a tener en cuenta
+
+- **GCP es uno de los 3 grandes** proveedores (con AWS y Azure). Los servicios se parecen, pero a veces las diferencias importan.
+- **Cloud Run abstrae mucho:** DNS, SSL, balanceo de carga y autoescalado. Muchas empresas los gestionan a mano; siguen siendo habilidades valiosas.
+- **Turso es un host gestionado de terceros;** hay muchas otras opciones de BD y hosting.
+- **Casi todo tiene alternativas.** No hace falta dominarlas todas, pero sí entender algunas.
+
+### Mapa de equivalencias GCP ↔ AWS (stack de La Tinka)
+
+| Curso (GCP) | AWS / La Tinka |
+|---|---|
+| GitHub Actions | GitHub Actions / Jenkins / CodePipeline |
+| Artifact Registry | ECR |
+| Cloud Build | CodeBuild |
+| Cloud Run | EKS / ECS Fargate / App Runner |
+| WIF + Service Account | OIDC Provider + IAM Role (IRSA en EKS) |
+| Secret Manager | AWS Secrets Manager / Kubernetes Secrets |
+| Turso + goose | Oracle 19c + Flyway / Liquibase |
+| gosec / staticcheck | SonarQube / SpotBugs |
+
+## Limpieza (al terminar)
+
+⚠️ **Orden importante:** hacer el merge final de `docs` → `main` **antes** de borrar recursos, porque ese merge dispara el CD.
+
+```bash
+# 1. Merge final de la documentación (dispara el CD una última vez)
+cd ~/learn-cicd-starter
+git checkout docs
+git merge main                       # traer los cambios de main a docs
+# → PR docs → main → merge → esperar CD ✅
+
+# 2. Borrar la BD de Turso
+turso db destroy notely-db
+
+# 3. Cerrar el proyecto de GCP (borra Cloud Run, Artifact Registry, Secret Manager, WIF…)
+#    https://console.cloud.google.com/iam-admin/settings → Shut down
+gcloud projects delete inner-cinema-511617-v1   # alternativa por CLI
+
+# 4. Opcional: borrar el secreto DATABASE_URL del repo
+#    GitHub → Settings → Secrets and variables → Actions
+```
+
+---
+
 # ESTADO DEL CURSO
 
 | Sección | Estado |
@@ -3680,9 +4345,10 @@ b5b190e cd: deploy to Cloud Run and update welcome heading
 | 5 — Security | ✅ Completada |
 | 6 — Continuous Deployment (Build) | ✅ Completada |
 | 7 — Continuous Deployment (Deploy) | ✅ Completada |
-| 8 — Por confirmar al iniciar | ⏳ Pendiente |
+| 8 — Database | ✅ Completada |
+| Cierre — CI/CD Review | ✅ **Curso terminado** (27/11/2026) |
 
-### Pipeline actual
+### Pipeline final
 
 ```
 PR hacia main (ci.yml)
@@ -3694,16 +4360,19 @@ PR hacia main (ci.yml)
       │     ├─ go install gosec           │     ├─ go install staticcheck
       │     └─ gosec ./...                │     └─ staticcheck ./...
 
-Push a main (cd.yml)
+Push a main (cd.yml)   env: DATABASE_URL ← secrets.DATABASE_URL
       │
       └──► Job "Deploy"
             ├─ checkout
             ├─ setup-go
+            ├─ go install goose
             ├─ ./scripts/buildprod.sh
             ├─ google-github-actions/auth  (WIF)
             ├─ google-github-actions/setup-gcloud
             ├─ gcloud builds submit ──► Artifact Registry (notely:latest)
-            └─ gcloud run deploy    ──► Cloud Run (servicio notely, us-central1) 🌐
+            ├─ ./scripts/migrateup.sh ──► Turso (notely-db)
+            └─ gcloud run deploy    ──► Cloud Run (notely, us-central1) 🌐
+                                          └─ DATABASE_URL ← Secret Manager (notely_db_password)
 ```
 
 ### Ramas y PRs
@@ -3718,24 +4387,28 @@ Push a main (cd.yml)
 | `build` | #7 | ✅ Mergeada a `main` (`a2d18d0`) — ciclo cerrado |
 | `auto-build` | #8 | ✅ Mergeada a `main` (`d1889af`) — ciclo cerrado |
 | `deploy` | #11 | ✅ Mergeada a `main` (`e440363`) — ciclo cerrado |
+| `migrations` | #12 | ✅ Mergeada a `main` (`4fd4b38`) — ciclo cerrado |
+| `docs` | — | ⏳ Pendiente: merge final a `main` |
 | — | bootdotdev#2988 | ❌ Creado por error contra el repo original — cerrado |
 
-### Recursos en GCP (eliminar al terminar el curso)
+### Recursos a eliminar (limpieza)
 
-| Recurso | Valor |
-|---|---|
-| Proyecto | `notely` (`inner-cinema-511617-v1`) |
-| Facturación | `notely-billing` (cuenta pagada) |
-| Artifact Registry | `notely-ar-repo` (us-central1) |
-| Service account | `cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com` |
-| WIF | Pool `github` / Provider `my-repo` |
-| Cloud Run | Servicio `notely` (us-central1, público, máx. 4 instancias) |
+| Recurso | Valor | Cómo eliminar |
+|---|---|---|
+| Proyecto GCP | `notely` (`inner-cinema-511617-v1`) | Shut down del proyecto (borra todo lo de abajo) |
+| ↳ Artifact Registry | `notely-ar-repo` (us-central1) | (incluido) |
+| ↳ Cloud Run | Servicio `notely` | (incluido) |
+| ↳ Secret Manager | `notely_db_password` | (incluido) |
+| ↳ Service account | `cloud-run-deployer@inner-cinema-511617-v1.iam.gserviceaccount.com` | (incluido) |
+| ↳ WIF | Pool `github` / Provider `my-repo` | (incluido) |
+| Facturación | `notely-billing` | Revisar que no queden cargos; cerrar la cuenta si no se usará |
+| Turso | `notely-db` | `turso db destroy notely-db` |
+| GitHub | Secreto `DATABASE_URL` | Settings → Secrets and variables → Actions |
 
-**Próximo paso:** al iniciar la siguiente sección, crear una rama nueva desde `main` actualizado:
+### Pendientes finales
 
-```bash
-cd ~/learn-cicd-starter
-git checkout main
-git pull origin main
-git checkout -b <nombre-rama-seccion-8>
-```
+1. [ ] Commit de esta consolidación en la rama `docs`
+2. [ ] Merge final `docs` → `main` (dispara el CD: hacerlo **antes** de la limpieza)
+3. [ ] `turso db destroy notely-db`
+4. [ ] Cerrar el proyecto `notely` en GCP
+5. [ ] Borrar el secreto `DATABASE_URL` del repo
